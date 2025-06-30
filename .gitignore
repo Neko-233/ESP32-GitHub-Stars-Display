@@ -1,0 +1,10 @@
+# Arduino IDE build files
+*.d
+*.o
+*.a
+*.bin
+*.elf
+*.hex
+/build/
+# 忽略私密配置文件
+secrets.h
