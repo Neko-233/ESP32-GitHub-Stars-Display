@@ -979,7 +979,7 @@ void create_settings_screen() {
     // 创建现代化标题容器
     lv_obj_t* title_container = lv_obj_create(screen_settings);
     lv_obj_set_size(title_container, 280, 50);
-    lv_obj_align(title_container, LV_ALIGN_TOP_MID, 0, 15);
+    lv_obj_align(title_container, LV_ALIGN_TOP_MID, 0, 10);
     lv_obj_set_style_bg_color(title_container, lv_color_hex(0x1e3a8a), 0);
     lv_obj_set_style_bg_grad_color(title_container, lv_color_hex(0x3b82f6), 0);
     lv_obj_set_style_bg_grad_dir(title_container, LV_GRAD_DIR_HOR, 0);
@@ -996,8 +996,8 @@ void create_settings_screen() {
     
     // 创建现代化设置选项容器
     lv_obj_t* options_container = lv_obj_create(screen_settings);
-    lv_obj_set_size(options_container, 280, 160);
-    lv_obj_align(options_container, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_set_size(options_container, 280, 190);
+    lv_obj_align(options_container, LV_ALIGN_CENTER, 0, 35);
     lv_obj_set_style_bg_color(options_container, lv_color_hex(0x1f2937), 0);
     lv_obj_set_style_border_width(options_container, 1, 0);
     lv_obj_set_style_border_color(options_container, lv_color_hex(0x374151), 0);
@@ -1008,7 +1008,7 @@ void create_settings_screen() {
     // WiFi设置按钮
     lv_obj_t* wifi_btn = lv_btn_create(options_container);
     lv_obj_set_size(wifi_btn, 250, 40);
-    lv_obj_align(wifi_btn, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_align(wifi_btn, LV_ALIGN_TOP_MID, 0, 15);
     lv_obj_set_style_bg_color(wifi_btn, lv_color_hex(0x059669), 0);
     lv_obj_set_style_bg_grad_color(wifi_btn, lv_color_hex(0x10b981), 0);
     lv_obj_set_style_bg_grad_dir(wifi_btn, LV_GRAD_DIR_HOR, 0);
@@ -1025,7 +1025,7 @@ void create_settings_screen() {
     // GitHub设置按钮
     lv_obj_t* github_btn = lv_btn_create(options_container);
     lv_obj_set_size(github_btn, 250, 40);
-    lv_obj_align(github_btn, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(github_btn, LV_ALIGN_TOP_MID, 0, 70);
     lv_obj_set_style_bg_color(github_btn, lv_color_hex(0x7c3aed), 0);
     lv_obj_set_style_bg_grad_color(github_btn, lv_color_hex(0x8b5cf6), 0);
     lv_obj_set_style_bg_grad_dir(github_btn, LV_GRAD_DIR_HOR, 0);
@@ -1042,7 +1042,7 @@ void create_settings_screen() {
     // 退出按钮
     lv_obj_t* exit_btn = lv_btn_create(options_container);
     lv_obj_set_size(exit_btn, 250, 40);
-    lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_align(exit_btn, LV_ALIGN_TOP_MID, 0, 125);
     lv_obj_set_style_bg_color(exit_btn, lv_color_hex(0xdc2626), 0);
     lv_obj_set_style_bg_grad_color(exit_btn, lv_color_hex(0xef4444), 0);
     lv_obj_set_style_bg_grad_dir(exit_btn, LV_GRAD_DIR_HOR, 0);
