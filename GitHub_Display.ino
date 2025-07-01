@@ -182,11 +182,14 @@ unsigned long lastDataUpdate = 0;        // 上次数据更新时间戳（毫秒
 unsigned long lastTimeUpdate = 0;        // 上次时间显示更新时间戳（毫秒）
 unsigned long lastProgressUpdate = 0;    // 上次进度条更新时间戳（毫秒）
 unsigned long updateSuccessTime = 0;     // 更新成功消息显示开始时间戳（毫秒）
+unsigned long manualRefreshStartTime = 0; // 手动刷新开始时间戳（毫秒）
 
 // 状态标志
 bool showingUpdateSuccess = false;       // 是否正在显示"Update Successful"消息
 bool isFetchingData = false;             // 是否正在获取GitHub数据
 bool networkErrorShowing = false;        // 是否正在显示网络错误消息框
+bool isManualRefreshing = false;         // 是否正在手动刷新
+bool refreshButtonGreen = false;         // 刷新按钮是否为绿色状态
 
 // 数字动画相关变量
 int animatingStars = -1;                 // 正在动画的星标数值
@@ -197,6 +200,7 @@ int animatingWatchers = -1;              // 正在动画的关注者数值
 const unsigned long UPDATE_INTERVAL = 300000;      // 数据更新间隔：5分钟（300秒）
 const unsigned long TIME_UPDATE_INTERVAL = 60000;  // 时间显示更新间隔：1分钟（60秒）
 const unsigned long SUCCESS_DISPLAY_TIME = 5000;   // 成功消息显示时长：5秒
+const unsigned long MANUAL_REFRESH_DURATION = 5000; // 手动刷新倒计时时长：5秒
 
 // ===== LVGL屏幕对象声明 =====
 // 主要界面屏幕
@@ -891,18 +895,39 @@ void setup_settings_button() {
 #ifdef ENABLE_TOUCH_TEST
 /**
  * 专用触摸测试按钮事件处理函数
- * 功能：处理左上角触摸测试按钮的点击事件
+ * 功能：处理左上角触摸测试按钮的点击事件，现在具有刷新功能
  * 特点：
- * - 每次点击切换按钮颜色（蓝色/绿色）
- * - 用于验证触摸功能是否正常工作
- * - 输出调试信息到串口
+ * - 点击后按钮从蓝色变绿色
+ * - 显示5秒倒计时刷新提示
+ * - 进度条从100%每秒递减20%
+ * - 倒计时结束后执行数据刷新
+ * - 刷新完成后按钮变回蓝色
  */
 void dedicated_touch_test_event_cb(lv_event_t *e) {
-    Serial.println("专用触摸测试按钮（左上角）已成功点击！");
-    static bool is_green = false;  // 静态变量记录当前颜色状态
-    // 三元运算符切换颜色：绿色时切换为蓝色，蓝色时切换为绿色
-    is_green ? lv_obj_set_style_bg_color(touch_test_btn, lv_color_hex(0x007BFF), 0) : lv_obj_set_style_bg_color(touch_test_btn, lv_color_hex(0x28A745), 0);
-    is_green = !is_green;  // 切换状态标志
+    Serial.println("专用触摸测试按钮（左上角）已成功点击！开始手动刷新流程");
+    
+    // 如果已经在刷新过程中，忽略点击
+    if (isManualRefreshing || isFetchingData) {
+        Serial.println("正在刷新中，忽略重复点击");
+        return;
+    }
+    
+    // 开始手动刷新流程
+    isManualRefreshing = true;
+    refreshButtonGreen = true;
+    manualRefreshStartTime = millis();
+    
+    // 按钮变绿色
+    lv_obj_set_style_bg_color(touch_test_btn, lv_color_hex(0x28A745), 0);
+    
+    // 显示刷新提示
+    updateStatus("Data will refresh in 5 seconds", lv_color_hex(0x3b82f6));
+    
+    // 进度条设置为100%
+    lv_obj_clear_flag(progress_bar, LV_OBJ_FLAG_HIDDEN);
+    lv_bar_set_value(progress_bar, 100, LV_ANIM_OFF);
+    
+    Serial.println("手动刷新倒计时开始，按钮已变绿，进度条设为100%");
 }
 
 /**
@@ -924,6 +949,7 @@ void setup_touch_test() {
     lv_obj_t *label = lv_label_create(touch_test_btn);
     lv_label_set_text(label, LV_SYMBOL_REFRESH);  // 使用LVGL内置刷新符号
     lv_obj_center(label);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);  // 设置字体
     Serial.println("触摸测试按钮已创建。");
 }
 #endif
@@ -2229,6 +2255,11 @@ void updateDisplay() {
  * - 从未更新过：显示"Last Upd: --"
  */
 void updateTimeDisplay() {
+    // 手动刷新期间跳过时间显示更新，避免干扰倒计时
+    if (isManualRefreshing) {
+        return;
+    }
+    
     // 检查WiFi连接状态，未连接时提示用户进入设置
     if (WiFi.status() != WL_CONNECTED) {
         lv_label_set_text(time_label, "Go to Settings");
@@ -2282,12 +2313,49 @@ void showCurrentTime() {
  * 更新进度条显示函数
  * 功能：根据距离下次数据更新的剩余时间，动态显示进度条
  * 逻辑：
+ * - 手动刷新倒计时：进度从100%每秒递减20%
  * - 刚更新成功：显示100%进度
  * - 正常情况：进度随时间递减（100% -> 0%）
  * - 从未更新：隐藏进度条
  * 特点：5分钟更新周期的可视化倒计时
  */
 void updateProgressBar() {
+    // 处理手动刷新倒计时
+    if (isManualRefreshing) {
+        unsigned long elapsed = millis() - manualRefreshStartTime;
+        if (elapsed < MANUAL_REFRESH_DURATION) {
+            // 计算倒计时进度：从100%线性递减到0%
+            int progress = 100 - (elapsed * 100) / MANUAL_REFRESH_DURATION;
+            if (progress < 0) progress = 0;  // 确保不会小于0%
+            lv_bar_set_value(progress_bar, progress, LV_ANIM_OFF);
+            
+            // 更新倒计时提示 - 优化更新频率
+            static int lastDisplayedSeconds = -1;
+            int remainingSeconds = (MANUAL_REFRESH_DURATION - elapsed) / 1000 + 1;
+            if (remainingSeconds != lastDisplayedSeconds) {
+                char countdownMsg[50];
+                snprintf(countdownMsg, sizeof(countdownMsg), "Data will refresh in %d seconds", remainingSeconds);
+                updateStatus(countdownMsg, lv_color_hex(0x3b82f6));
+                lastDisplayedSeconds = remainingSeconds;
+                Serial.printf("倒计时更新: %d 秒\n", remainingSeconds);
+            }
+            
+            // 强制UI刷新确保及时显示
+            lv_timer_handler();
+        } else {
+            // 倒计时结束，开始刷新数据
+            Serial.println("手动刷新倒计时结束，开始获取数据");
+            isManualRefreshing = false;
+            lastDataUpdate = millis();  // 更新时间戳
+            fetchGitHubData();  // 执行数据刷新
+            
+            // 按钮变回蓝色
+            lv_obj_set_style_bg_color(touch_test_btn, lv_color_hex(0x007BFF), 0);
+            refreshButtonGreen = false;
+        }
+        return;
+    }
+    
     if (lastDataUpdate > 0) {
         unsigned long timeSinceUpdate = millis() - lastDataUpdate;  // 计算已过时间
         lv_obj_clear_flag(progress_bar, LV_OBJ_FLAG_HIDDEN);  // 显示进度条
@@ -2512,8 +2580,9 @@ void loop() {
         lastTimeUpdate = currentMillis;
     }
     
-    // 定时更新进度条（每5秒更新一次，显示距离下次更新的剩余时间）
-    if (currentMillis - lastProgressUpdate >= 5000) {
+    // 定时更新进度条（手动刷新时每100ms更新一次，正常时每5秒更新一次）
+    unsigned long progressUpdateInterval = isManualRefreshing ? 100 : 5000;
+    if (currentMillis - lastProgressUpdate >= progressUpdateInterval) {
         updateProgressBar();
         lastProgressUpdate = currentMillis;
     }
