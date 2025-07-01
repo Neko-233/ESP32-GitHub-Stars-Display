@@ -6,7 +6,6 @@
 
 ![image](https://github.com/user-attachments/assets/6470316a-c315-4138-9b5e-e440f90ab6a2)
 
-
 ## ✨ 主要功能
 
 * **实时数据显示**: 通过 GitHub API 实时获取并展示仓库核心数据。
@@ -31,32 +30,48 @@
 
 * **触摸驱动**: XPT2046
 
-*理论上，任何使用相同驱动芯片和引脚配置的 ESP32 开发板都可以运行此项目。*
-
 ## ⚙️ 环境配置与依赖
 
-本项目基于 **Arduino IDE** 进行开发。在编译上传前，请确保你已完成以下环境配置：
+本项目基于 **Arduino IDE** 进行开发。在编译上传前，请确保你已完成以下所有环境配置：
 
-### 1. 下载项目文件
+### 1. Arduino IDE 设置 (关键步骤)
 
-点击本页面右上角的 `Code` -> `Download ZIP` 下载本项目，并解压到你的 Arduino 项目文件夹中。
+打开 Arduino IDE，在“工具”菜单中，确保你的开发板配置与以下设置完全一致，这对于 `ESP32-2432S028R` 的正常工作至关重要：
+
+| 设置项              | 值                               |
+| ------------------- | -------------------------------- |
+| **Board** | "ESP32 Dev Module"               |
+| **Upload Speed** | "921600"                         |
+| **CPU Frequency** | "240MHz (WiFi/BT)"               |
+| **Flash Frequency** | "80MHz"                          |
+| **Flash Mode** | "QIO"                            |
+| **Flash Size** | "4MB (32Mb)"                     |
+| **Partition Scheme**| "Huge APP (3MB No OTA/1MB SPIFFS)" |
+| **PSRAM** | "Enabled"                        |
 
 ### 2. 安装 ESP32 开发板支持
 
-在 Arduino IDE 的“首选项”中，将以下 URL 添加到“附加开发板管理器网址”中：
-`https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
-然后通过“开发板管理器”搜索并安装 `esp32`。
+1. 打开 Arduino IDE，进入“文件” > “首选项”。
+
+2. 在“附加开发板管理器网址”中，填入以下 URL：
+   ```
+   [https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json](https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json)
+   ```
+
+3. 打开“工具” > “开发板” > “开发板管理器”。
+
+4. 搜索 `esp32` 并安装由 Espressif Systems 提供的库。
 
 ### 3. 安装必要的库
 
 请通过 Arduino IDE 的 **“库管理器”** 搜索并安装以下所有库的最新版本：
 
-| **库名称** | **作者** | 
-| --- | --- |
-| `LovyanGFX` | lovyan03 | 
-| `LVGL` | lvgl | 
-| `XPT2046_Touchscreen` | Paul Stoffregen | 
-| `ArduinoJson` | Benoit Blanchon | 
+| 库名称                | 作者             |
+| --------------------- | ---------------- |
+| `LovyanGFX`           | lovyan03         |
+| `LVGL`                | lvgl             |
+| `XPT2046_Touchscreen` | Paul Stoffregen  |
+| `ArduinoJson`         | Benoit Blanchon  |
 
 ### 4. 创建你的私密配置文件 (重要！)
 
@@ -92,7 +107,6 @@
 ### 5. 确认项目文件结构
 
 完成以上步骤后，请确保你的项目文件夹中至少包含以下文件：
-
 ```
 GitHub_Display/
 ├── GitHub_Display.ino      (主代码文件)
@@ -107,7 +121,7 @@ GitHub_Display/
 
    * 用 Arduino IDE 打开 `GitHub_Display.ino` 文件。
 
-   * 连接你的 ESP32 开发板，在“工具”菜单中选择正确的开发板型号和端口。
+   * 连接你的 ESP32 开发板，再次确认“工具”菜单中的配置正确无误。
 
    * 点击“上传”按钮。
 
@@ -117,6 +131,10 @@ GitHub_Display/
 
    * **后续修改**: 你可以随时点击屏幕右上角的 **齿轮图标** `⚙️` 进入设置菜单，覆盖原有的 WiFi 或 GitHub 仓库设置。新的设置将被保存在设备的闪存中。
 
+## 🙏 致谢 (Acknowledgements)
+
+本项目的初始环境配置和硬件驱动设置，很大程度上参考了 [witnessmenow/ESP32-Cheap-Yellow-Display](https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display?tab=readme-ov-file) 项目。感谢这位作者的分享，为社区提供了极大的便利。
+
 ## 📝 许可证
 
-本项目采用 [MIT License](https://www.google.com/search?q=LICENSE) 开源。
+本项目采用 [MIT License](LICENSE) 开源。
