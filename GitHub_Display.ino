@@ -249,6 +249,12 @@ static lv_coord_t chart_data[50];       // 图表数据数组（最多50个数�
 int chart_data_count = 0;               // 当前数据点数量
 int chart_view_mode = 0;                // 图表显示模式：0=每次获取，1=每天数据，2=增长数据
 const char* DATA_FILE = "/stardata.csv"; // 数据文件路径
+const char* DAILY_DATA_FILE = "/daily_stars.csv"; // 每日数据文件路径
+const char* GROWTH_DATA_FILE = "/growth_data.csv"; // 增长数据文件路径
+
+// ===== 数据持久化相关变量 =====
+int lastSavedStars = -1;                // 上次保存的星标数，用于检测增长
+time_t lastDailySaveTime = 0;           // 上次每日保存的时间戳
 
 // ===== 函数前置声明 =====
 // UI创建函数
@@ -267,6 +273,9 @@ void load_settings();                                         // 从NVS加载配
 void save_settings();                                         // 将配置设置保存到NVS
 void fetchGitHubData();                                       // 获取GitHub仓库数据
 void saveStarData(int starCount);                             // 保存星标数据到文件
+void saveDailyStarData(int starCount);                        // 保存每日星标数据
+void saveGrowthData(int starCount);                           // 保存增长数据
+void checkAndSaveDailyData();                                 // 检查并保存每日数据（23:59调用）
 void loadChartData();                                         // 从文件加载图表数据
 void updateChartDisplay();                                    // 更新图表显示
 
@@ -652,7 +661,7 @@ void create_chart_screen() {
     
     // 创建标题标签
     lv_obj_t* title_label = lv_label_create(screen_chart);
-    lv_label_set_text(title_label, "Stars Historical Data");
+    lv_label_set_text(title_label, "STARS Chart");
     lv_obj_set_style_text_font(title_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(title_label, lv_color_hex(0xf1f5f9), 0);
     lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 10);
@@ -690,12 +699,16 @@ void create_chart_screen() {
     // 创建图表容器
     lv_obj_t* chart_container = lv_obj_create(screen_chart);
     lv_obj_set_size(chart_container, 300, 180);
-    lv_obj_align(chart_container, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_align(chart_container, LV_ALIGN_CENTER, 0, 25);
     lv_obj_set_style_bg_color(chart_container, lv_color_hex(0x1e293b), 0);
     lv_obj_set_style_border_color(chart_container, lv_color_hex(0x475569), 0);
     lv_obj_set_style_border_width(chart_container, 1, 0);
     lv_obj_set_style_radius(chart_container, 8, 0);
     lv_obj_set_style_pad_all(chart_container, 10, 0);
+    
+    // 禁用图表容器的滚动功能
+    lv_obj_clear_flag(chart_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(chart_container, LV_SCROLLBAR_MODE_OFF);
     
     // 创建LVGL图表对象
     chart_obj = lv_chart_create(chart_container);
@@ -726,20 +739,15 @@ void create_chart_screen() {
     lv_obj_set_style_size(chart_obj, 6, 6, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(chart_obj, lv_color_hex(0x10b981), LV_PART_INDICATOR);
     
-    // 创建Y轴标签（纵轴）
+    // 创建Y轴标签（纵轴）- 放在图表左上角，竖向排列
     lv_obj_t* y_axis_label = lv_label_create(chart_container);
-    lv_label_set_text(y_axis_label, "Stars");
+    lv_label_set_text(y_axis_label, "STARS");
     lv_obj_set_style_text_font(y_axis_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(y_axis_label, lv_color_hex(0x94a3b8), 0);
-    lv_obj_align_to(y_axis_label, chart_obj, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+    lv_obj_align_to(y_axis_label, chart_obj, LV_ALIGN_OUT_TOP_LEFT, -5, -5);
     lv_obj_set_style_transform_angle(y_axis_label, 900, 0);  // 旋转90度
     
-    // 创建X轴标签（横轴）
-    lv_obj_t* x_axis_label = lv_label_create(chart_container);
-    lv_label_set_text(x_axis_label, "Time");
-    lv_obj_set_style_text_font(x_axis_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(x_axis_label, lv_color_hex(0x94a3b8), 0);
-    lv_obj_align_to(x_axis_label, chart_obj, LV_ALIGN_OUT_BOTTOM_MID, 0, 5);
+    // 移除TIME标签，直接在图表下方显示横坐标标签
     
     // 说明文本已删除，改为在数据点上显示具体数值
     
@@ -1817,7 +1825,7 @@ void createUI() {
     lv_label_set_text(current_time_label, "--:--:--");
     lv_obj_set_style_text_color(current_time_label, lv_color_hex(0x9ca3af), 0);
     lv_obj_set_style_text_font(current_time_label, &lv_font_montserrat_16, 0);
-    lv_obj_align_to(current_time_label, title_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 5);
+    lv_obj_align(current_time_label, LV_ALIGN_TOP_MID, 0, 30);
 
     // --- 主要星星显示区域 ---
     lv_obj_t* stars_container = lv_obj_create(main_screen);
@@ -1946,6 +1954,8 @@ void load_settings() {
     preferences.getString("repoName", repoName, sizeof(repoName));   // GitHub仓库名称
     preferences.getString("githubToken", githubToken, sizeof(githubToken)); // GitHub访问令牌
     yesterdayStars = preferences.getInt("yesterdayStars", -1);   // 昨日星标数量
+    lastDailySaveTime = preferences.getULong("lastDailySave", 0); // 上次每日保存时间
+    lastSavedStars = preferences.getInt("lastSavedStars", -1);   // 上次保存的星标数
     preferences.end();  // 关闭NVS访问
     
     Serial.println("加载的设置:");
@@ -1974,6 +1984,8 @@ void save_settings() {
     preferences.putString("repoName", repoName);   // 保存GitHub仓库名称
     preferences.putString("githubToken", githubToken); // 保存GitHub访问令牌
     preferences.putInt("yesterdayStars", yesterdayStars); // 保存昨日星标数量
+    preferences.putULong("lastDailySave", lastDailySaveTime); // 保存上次每日保存时间
+    preferences.putInt("lastSavedStars", lastSavedStars); // 保存上次保存的星标数
     preferences.end();  // 关闭NVS访问，确保数据写入Flash
     
     Serial.println("保存的设置:");
@@ -2905,6 +2917,7 @@ void loop() {
             showCurrentTime();   // 显示当前系统时间（如果不在显示更新成功状态且不在获取数据）
         }
         updateTimeDisplay();     // 更新"Last Upd"时间显示
+        checkAndSaveDailyData(); // 检查并保存每日数据
         lastTimeUpdate = currentMillis;
     }
     
@@ -2971,6 +2984,9 @@ void saveStarData(int starCount) {
     
     Serial.printf("已保存数据: 时间戳=%lu, 星标=%d\n", now, starCount);
     
+    // 同时保存增长数据（如果有增长）
+    saveGrowthData(starCount);
+    
     // 检查文件大小，如果超过限制则清理旧数据
     file = LittleFS.open(DATA_FILE, "r");
     if (file) {
@@ -3017,6 +3033,159 @@ void cleanupOldData() {
 }
 
 /**
+ * 保存每日星标数据
+ * 功能：在每天23:59分保存当天的星标数，用于七天数据统计
+ */
+void saveDailyStarData(int starCount) {
+    Serial.println("=== 保存每日星标数据 ===");
+    Serial.printf("=== 接收到的starCount参数值: %d ===\n", starCount);
+    
+    // 获取当前时间戳
+    time_t now;
+    time(&now);
+    Serial.printf("=== 当前时间戳: %lu ===\n", now);
+    
+    // 打开文件进行追加写入
+    File file = LittleFS.open(DAILY_DATA_FILE, "a");
+    if (!file) {
+        Serial.println("无法打开每日数据文件进行写入");
+        return;
+    }
+    
+    // 写入数据：时间戳,星标数量
+    Serial.printf("=== 准备写入每日文件: 时间戳=%lu, 星标=%d ===\n", (unsigned long)now, starCount);
+    file.printf("%lu,%d\n", (unsigned long)now, starCount);
+    file.close();
+    
+    Serial.printf("已保存每日数据: 时间戳=%lu, 星标=%d\n", now, starCount);
+    
+    // 检查文件大小，保留最近7天的数据
+    file = LittleFS.open(DAILY_DATA_FILE, "r");
+    if (file) {
+        String lines[10];  // 最多保存10行（超过7天的缓冲）
+        int lineCount = 0;
+        
+        while (file.available() && lineCount < 10) {
+            lines[lineCount] = file.readStringUntil('\n');
+            lineCount++;
+        }
+        file.close();
+        
+        // 如果超过7行，保留最新的7行
+        if (lineCount > 7) {
+            file = LittleFS.open(DAILY_DATA_FILE, "w");
+            if (file) {
+                int keepFrom = lineCount - 7;
+                for (int i = keepFrom; i < lineCount; i++) {
+                    file.println(lines[i]);
+                }
+                file.close();
+                Serial.printf("每日数据清理完成，保留了最近7天数据\n");
+            }
+        }
+    }
+}
+
+/**
+ * 保存增长数据
+ * 功能：只保存有增长的数据点，用于增长图表显示
+ */
+void saveGrowthData(int starCount) {
+    // 检查是否有增长
+    if (lastSavedStars >= 0 && starCount <= lastSavedStars) {
+        Serial.printf("星标数无增长 (%d -> %d)，跳过保存\n", lastSavedStars, starCount);
+        return;
+    }
+    
+    Serial.println("=== 保存增长数据 ===");
+    Serial.printf("=== 检测到增长: %d -> %d ===\n", lastSavedStars, starCount);
+    
+    // 获取当前时间戳
+    time_t now;
+    time(&now);
+    
+    // 打开文件进行追加写入
+    File file = LittleFS.open(GROWTH_DATA_FILE, "a");
+    if (!file) {
+        Serial.println("无法打开增长数据文件进行写入");
+        return;
+    }
+    
+    // 写入数据：时间戳,星标数量
+    file.printf("%lu,%d\n", (unsigned long)now, starCount);
+    file.close();
+    
+    Serial.printf("已保存增长数据: 时间戳=%lu, 星标=%d\n", now, starCount);
+    
+    // 检查文件大小，如果超过限制则清理旧数据
+    file = LittleFS.open(GROWTH_DATA_FILE, "r");
+    if (file) {
+        size_t fileSize = file.size();
+        file.close();
+        
+        // 如果文件超过5KB，保留最新的50%数据
+        if (fileSize > 5120) {
+            Serial.println("增长数据文件过大，清理旧数据...");
+            
+            file = LittleFS.open(GROWTH_DATA_FILE, "r");
+            if (file) {
+                String lines[100];  // 最多保存100行
+                int lineCount = 0;
+                
+                while (file.available() && lineCount < 100) {
+                    lines[lineCount] = file.readStringUntil('\n');
+                    lineCount++;
+                }
+                file.close();
+                
+                // 保留后一半数据
+                int keepFrom = lineCount / 2;
+                
+                file = LittleFS.open(GROWTH_DATA_FILE, "w");
+                if (file) {
+                    for (int i = keepFrom; i < lineCount; i++) {
+                        file.println(lines[i]);
+                    }
+                    file.close();
+                    Serial.printf("增长数据清理完成，保留了 %d 行数据\n", lineCount - keepFrom);
+                }
+            }
+        }
+    }
+    
+    // 更新上次保存的星标数
+    lastSavedStars = starCount;
+}
+
+/**
+ * 检查并保存每日数据
+ * 功能：在每天23:59分自动调用，保存当天的星标数
+ */
+void checkAndSaveDailyData() {
+    time_t now;
+    time(&now);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    
+    // 检查是否是23:59分
+    if (timeinfo.tm_hour == 23 && timeinfo.tm_min == 59) {
+        // 检查是否已经保存过今天的数据（避免重复保存）
+        time_t todayStart = now - (timeinfo.tm_hour * 3600 + timeinfo.tm_min * 60 + timeinfo.tm_sec);
+        
+        if (lastDailySaveTime < todayStart && currentStars >= 0) {
+            Serial.println("检测到23:59分，保存每日数据");
+            saveDailyStarData(currentStars);
+            lastDailySaveTime = now;
+            
+            // 保存到NVS以便重启后记住
+            preferences.begin("gh-display", false);
+            preferences.putULong("lastDailySave", lastDailySaveTime);
+            preferences.end();
+        }
+    }
+}
+
+/**
  * 加载图表数据
  * 功能：从文件系统读取历史数据并根据显示模式处理
  */
@@ -3026,9 +3195,22 @@ void loadChartData() {
     // 清空现有数据
     chart_data_count = 0;
     
-    File file = LittleFS.open(DATA_FILE, "r");
+    // 根据显示模式选择数据文件
+    const char* dataFile;
+    if (chart_view_mode == 1) {
+        dataFile = DAILY_DATA_FILE;  // 每天数据使用专门的每日文件
+        Serial.println("使用每日数据文件");
+    } else if (chart_view_mode == 2) {
+        dataFile = GROWTH_DATA_FILE;  // 增长数据使用专门的增长文件
+        Serial.println("使用增长数据文件");
+    } else {
+        dataFile = DATA_FILE;  // 每次获取数据使用原始文件
+        Serial.println("使用原始数据文件");
+    }
+    
+    File file = LittleFS.open(dataFile, "r");
     if (!file) {
-        Serial.println("数据文件不存在");
+        Serial.printf("数据文件不存在: %s\n", dataFile);
         return;
     }
     
@@ -3073,37 +3255,18 @@ void loadChartData() {
             chart_data_count++;
         }
     } else if (chart_view_mode == 1) {
-        // 模式1：每天数据（按天聚合，显示最近7天）
-        time_t lastDay = 0;
-        int dailyData[7];
-        int dailyCount = 0;
-        
-        // 从最新数据开始，向前查找7天的数据
-        for (int i = totalCount - 1; i >= 0 && dailyCount < 7; i--) {
-            time_t currentDay = allData[i].timestamp / 86400;  // 转换为天数
-            if (currentDay != lastDay) {
-                dailyData[dailyCount] = allData[i].stars;
-                dailyCount++;
-                lastDay = currentDay;
-            }
-        }
-        
-        // 反转数组，使时间顺序正确
-        for (int i = dailyCount - 1; i >= 0; i--) {
-            chart_data[chart_data_count] = dailyData[i];
+        // 模式1：每天数据（直接使用每日文件的数据，显示最近7天）
+        int startIndex = (totalCount > 7) ? totalCount - 7 : 0;
+        for (int i = startIndex; i < totalCount; i++) {
+            chart_data[chart_data_count] = allData[i].stars;
             chart_data_count++;
         }
     } else if (chart_view_mode == 2) {
-        // 模式2：增长数据（显示最近10个点的增长）
-        if (totalCount > 1) {
-            int startIndex = (totalCount > 10) ? totalCount - 10 : 0;
-            int baseStars = (startIndex > 0) ? allData[startIndex - 1].stars : allData[0].stars;
-            
-            for (int i = startIndex; i < totalCount; i++) {
-                int growth = allData[i].stars - baseStars;
-                chart_data[chart_data_count] = growth;
-                chart_data_count++;
-            }
+        // 模式2：增长数据（直接使用增长文件的数据，显示最近10个点）
+        int startIndex = (totalCount > 10) ? totalCount - 10 : 0;
+        for (int i = startIndex; i < totalCount; i++) {
+            chart_data[chart_data_count] = allData[i].stars;
+            chart_data_count++;
         }
     }
     
@@ -3191,7 +3354,7 @@ void updateChartDisplay() {
                 y_pos = chart_area.y2 - ((chart_data[i] - minVal + margin) * chart_height) / (maxVal - minVal + 2 * margin);
             }
             
-            // 创建数据点数值标签
+            // 创建数据点数值标签 - 根据数据相同情况决定上下位置
             lv_obj_t* value_label = lv_label_create(parent);
             lv_label_set_text_fmt(value_label, "%d", chart_data[i]);
             lv_obj_set_style_text_font(value_label, &lv_font_montserrat_10, 0);
@@ -3200,13 +3363,51 @@ void updateChartDisplay() {
             lv_obj_update_layout(value_label);
             lv_coord_t label_width = lv_obj_get_width(value_label);
             lv_coord_t label_height = lv_obj_get_height(value_label);
-            // 精确居中对齐：x坐标减去标签宽度的一半，y坐标向上偏移
+            
+            // 检查是否所有数据相同（形成直线）
+            bool all_same = true;
+            for (int j = 1; j < chart_data_count; j++) {
+                if (chart_data[j] != chart_data[0]) {
+                    all_same = false;
+                    break;
+                }
+            }
+            
+            // 获取父容器坐标用于转换绝对坐标到相对坐标
+            lv_area_t parent_area;
+            lv_obj_get_coords(parent, &parent_area);
+            
+            // 精确居中对齐：x坐标减去标签宽度的一半
             lv_coord_t value_label_x = x_pos - label_width / 2;
-            lv_coord_t value_label_y = y_pos - label_height - 8;
-            // 限制标签位置不超出图表容器范围
-            if (value_label_x < container_left_narrow) value_label_x = container_left_narrow;
-            if (value_label_x + label_width > container_right_narrow) value_label_x = container_right_narrow - label_width;
-            if (value_label_y < container_top) value_label_y = container_top;
+            lv_coord_t value_label_y;
+            
+            if (all_same) {
+                // 所有数据相同时，交替显示在上方和下方
+                if (i % 2 == 0) {
+                    value_label_y = y_pos - label_height - 10;  // 数据点上方2像素
+                } else {
+                    value_label_y = y_pos + 1;  // 数据点下方2像素
+                }
+            } else {
+                // 数据不同时，统一显示在上方
+                value_label_y = y_pos - label_height - 2;  // 数据点上方2像素
+            }
+            
+            // 转换为相对于父容器的坐标
+            value_label_x -= parent_area.x1;
+            value_label_y -= parent_area.y1;
+            
+            // 限制标签位置不超出图表容器范围（相对坐标）
+            lv_coord_t container_left_rel = container_left_narrow - parent_area.x1;
+            lv_coord_t container_right_rel = container_right_narrow - parent_area.x1;
+            lv_coord_t container_top_rel = container_top - parent_area.y1;
+            lv_coord_t container_bottom_rel = (chart_area.y2 + 30) - parent_area.y1;
+            
+            if (value_label_x < container_left_rel) value_label_x = container_left_rel;
+            if (value_label_x + label_width > container_right_rel) value_label_x = container_right_rel - label_width;
+            if (value_label_y < container_top_rel) value_label_y = container_top_rel;
+            if (value_label_y + label_height > container_bottom_rel) value_label_y = container_bottom_rel - label_height;
+            
             lv_obj_set_pos(value_label, value_label_x, value_label_y);
             lv_obj_set_user_data(value_label, (void*)0x1234);  // 标记为数据点标签
             
@@ -3243,11 +3444,21 @@ void updateChartDisplay() {
             lv_obj_update_layout(x_label);
             lv_coord_t x_label_width = lv_obj_get_width(x_label);
             // 精确居中对齐：x坐标减去标签宽度的一半
-            // 限制标签位置不超出图表容器范围
             lv_coord_t x_label_x = x_pos - x_label_width / 2;
-            if (x_label_x < container_left_wide) x_label_x = container_left_wide;
-            if (x_label_x + x_label_width > container_right_wide) x_label_x = container_right_wide - x_label_width;
-            lv_obj_set_pos(x_label, x_label_x, chart_area.y2 + 8);
+            lv_coord_t x_label_y = chart_area.y2 - 2;  // 显示在图表下方，更靠近图表
+            
+            // 转换为相对于父容器的坐标
+            x_label_x -= parent_area.x1;
+            x_label_y -= parent_area.y1;
+            
+            // 限制标签位置不超出图表容器范围（相对坐标）
+            lv_coord_t container_left_wide_rel = container_left_wide - parent_area.x1;
+            lv_coord_t container_right_wide_rel = container_right_wide - parent_area.x1;
+            
+            if (x_label_x < container_left_wide_rel) x_label_x = container_left_wide_rel;
+            if (x_label_x + x_label_width > container_right_wide_rel) x_label_x = container_right_wide_rel - x_label_width;
+            
+            lv_obj_set_pos(x_label, x_label_x, x_label_y);
         }
     }
     
@@ -3275,8 +3486,8 @@ static void stars_card_event_cb(lv_event_t * e) {
         // 更新图表显示
         updateChartDisplay();
         
-        // 切换到图表界面
-        lv_scr_load_anim(screen_chart, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+        // 切换到图表界面（加快动画速度）
+        lv_scr_load_anim(screen_chart, LV_SCR_LOAD_ANIM_MOVE_LEFT, 100, 0, false);
         
         // 隐藏设置和刷新按钮
         control_buttons_visibility(screen_chart);
@@ -3287,17 +3498,46 @@ static void stars_card_event_cb(lv_event_t * e) {
  * 图表界面返回按钮事件回调函数
  * 功能：从图表界面返回到主界面
  */
+/**
+ * 图表界面返回按钮事件回调函数
+ * 功能：处理图表界面的返回操作，清理图表内存并切换回主界面
+ * 参数：e - LVGL事件对象
+ */
 static void chart_back_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     
     if (code == LV_EVENT_CLICKED) {
-        Serial.println("图表界面返回按钮被点击");
+        Serial.println("图表界面返回按钮被点击，开始清理图表内存");
         
-        // 切换回主界面
-        lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+        // 先切换回主界面（加快动画速度）
+        lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 100, 0, false);
         
         // 恢复设置和刷新按钮显示
         control_buttons_visibility(main_screen);
+        
+        // 延迟清理图表界面，避免删除活动屏幕
+        lv_timer_t * cleanup_timer = lv_timer_create([](lv_timer_t * timer) {
+            // 清理图表数据
+            chart_data_count = 0;
+            memset(chart_data, 0, sizeof(chart_data));
+            
+            // 重置图表对象指针
+            chart_obj = NULL;
+            chart_series = NULL;
+            
+            // 删除图表界面以释放内存
+            if (screen_chart != NULL) {
+                lv_obj_del(screen_chart);
+                screen_chart = NULL;
+                Serial.println("图表界面内存已清理");
+            }
+            
+            // 删除定时器
+            lv_timer_del(timer);
+        }, 150, NULL);
+        
+        // 设置定时器只执行一次
+        lv_timer_set_repeat_count(cleanup_timer, 1);
     }
 }
 
