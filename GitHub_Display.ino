@@ -65,6 +65,7 @@
 #include <XPT2046_Touchscreen.h>  // XPT2046触摸屏库：处理电阻式触摸屏的触摸检测和坐标转换
 #include <SPI.h>                  // SPI通信库：用于与显示屏和触摸屏进行SPI通信
 #include <Preferences.h>          // ESP32偏好设置库：在NVS(非易失性存储)中保存WiFi和GitHub配置
+#include <LittleFS.h>             // LittleFS文件系统库：用于持久化存储历史数据
 #include "secrets.h"
 
 // ===== Font Awesome 图标字体文件 =====
@@ -183,6 +184,7 @@ unsigned long lastTimeUpdate = 0;        // 上次时间显示更新时间戳（
 unsigned long lastProgressUpdate = 0;    // 上次进度条更新时间戳（毫秒）
 unsigned long updateSuccessTime = 0;     // 更新成功消息显示开始时间戳（毫秒）
 unsigned long manualRefreshStartTime = 0; // 手动刷新开始时间戳（毫秒）
+unsigned long retryTime = 0;             // 重试时间戳（毫秒）
 
 // 状态标志
 bool showingUpdateSuccess = false;       // 是否正在显示"Update Successful"消息
@@ -190,6 +192,7 @@ bool isFetchingData = false;             // 是否正在获取GitHub数据
 bool networkErrorShowing = false;        // 是否正在显示网络错误消息框
 bool isManualRefreshing = false;         // 是否正在手动刷新
 bool refreshButtonGreen = false;         // 刷新按钮是否为绿色状态
+bool waitingForRetry = false;            // 是否正在等待重试
 
 // 数字动画相关变量
 int animatingStars = -1;                 // 正在动画的星标数值
@@ -201,6 +204,7 @@ const unsigned long UPDATE_INTERVAL = 300000;      // 数据更新间隔：5分�
 const unsigned long TIME_UPDATE_INTERVAL = 60000;  // 时间显示更新间隔：1分钟（60秒）
 const unsigned long SUCCESS_DISPLAY_TIME = 5000;   // 成功消息显示时长：5秒
 const unsigned long MANUAL_REFRESH_DURATION = 5000; // 手动刷新倒计时时长：5秒
+const unsigned long RETRY_INTERVAL = 1000;        // 重试间隔：1秒
 
 // ===== LVGL屏幕对象声明 =====
 // 主要界面屏幕
@@ -214,6 +218,9 @@ lv_obj_t *screen_github_settings;   // GitHub设置主界面
 lv_obj_t *screen_edit_owner;        // 编辑仓库所有者界面
 lv_obj_t *screen_edit_repo;         // 编辑仓库名称界面
 lv_obj_t *screen_edit_token;        // 编辑GitHub令牌界面
+
+// 数据可视化界面
+lv_obj_t *screen_chart;             // 数据可视化图表界面
 // ===== 主界面UI组件对象 =====
 lv_obj_t *title_label;          // 标题标签：显示仓库名称（所有者/仓库名）
 lv_obj_t *stars_count_label;    // 星标数量标签：显示GitHub星标数
@@ -231,6 +238,14 @@ lv_obj_t *touch_test_btn;       // 触摸测试按钮：左上角"T"图标，用
 // ===== 临时数据存储 =====
 static char selected_ssid[33];  // 当前选中的WiFi网络名称：用于WiFi连接流程
 
+// ===== 数据可视化相关变量 =====
+lv_obj_t *chart_obj;                    // LVGL图表对象
+lv_chart_series_t *chart_series;        // 图表数据系列
+static lv_coord_t chart_data[50];       // 图表数据数组（最多50个数据点）
+int chart_data_count = 0;               // 当前数据点数量
+int chart_view_mode = 0;                // 图表显示模式：0=每次获取，1=每天数据，2=增长数据
+const char* DATA_FILE = "/stardata.csv"; // 数据文件路径
+
 // ===== 函数前置声明 =====
 // UI创建函数
 void createUI();                                              // 创建主界面UI
@@ -241,11 +256,15 @@ void create_github_settings_screen();                         // 创建GitHub设
 void create_edit_owner_screen();                              // 创建编辑仓库所有者界面
 void create_edit_repo_screen();                               // 创建编辑仓库名称界面
 void create_edit_token_screen();                              // 创建编辑GitHub令牌界面
+void create_chart_screen();                                   // 创建数据可视化图表界面
 
 // 数据管理函数
 void load_settings();                                         // 从NVS加载配置设置
 void save_settings();                                         // 将配置设置保存到NVS
 void fetchGitHubData();                                       // 获取GitHub仓库数据
+void saveStarData(int starCount);                             // 保存星标数据到文件
+void loadChartData();                                         // 从文件加载图表数据
+void updateChartDisplay();                                    // 更新图表显示
 
 // 显示更新函数
 void updateStatus(const char *message, lv_color_t color);     // 更新状态标签显示
@@ -262,6 +281,9 @@ static void hide_keyboard_event_cb(lv_event_t * e);          // 隐藏虚拟键�
 static void show_keyboard_event_cb(lv_event_t * e);          // 显示虚拟键盘事件回调
 static void edit_field_event_cb(lv_event_t * e);             // 编辑字段事件回调
 static void save_field_event_cb(lv_event_t * e);             // 保存字段事件回调
+static void stars_card_event_cb(lv_event_t * e);             // 星星卡片点击事件回调
+static void chart_back_event_cb(lv_event_t * e);             // 图表界面返回事件回调
+static void chart_mode_event_cb(lv_event_t * e);             // 图表模式切换事件回调
 
 // ===== LVGL核心驱动函数 =====
 
@@ -609,7 +631,114 @@ static void settings_list_event_cb(lv_event_t * e) {
             lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_FADE_ON, 100, 0, false);  // 使用淡入动画返回主屏幕
             control_buttons_visibility(main_screen);  // 更新按钮显示状态
         }
-    }
+     }
+}
+
+/**
+ * 创建数据可视化图表界面
+ * 功能：创建包含图表、返回按钮和模式切换按钮的界面
+ */
+void create_chart_screen() {
+    Serial.println("=== 创建图表界面 ===");
+    
+    // 创建图表屏幕
+    screen_chart = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(screen_chart, lv_color_hex(0x0f172a), 0);  // 深色背景
+    
+    // 创建标题标签
+    lv_obj_t* title_label = lv_label_create(screen_chart);
+    lv_label_set_text(title_label, "Stars Historical Data");
+    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(title_label, lv_color_hex(0xf1f5f9), 0);
+    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 10);
+    
+    // 创建返回按钮
+    lv_obj_t* back_btn = lv_btn_create(screen_chart);
+    lv_obj_set_size(back_btn, 60, 30);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 10, 10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x475569), 0);
+    lv_obj_set_style_bg_grad_color(back_btn, lv_color_hex(0x64748b), 0);
+    lv_obj_set_style_bg_grad_dir(back_btn, LV_GRAD_DIR_VER, 0);
+    lv_obj_add_event_cb(back_btn, chart_back_event_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t* back_label = lv_label_create(back_btn);
+    lv_label_set_text(back_label, "Back");
+    lv_obj_set_style_text_font(back_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_label, lv_color_hex(0xf1f5f9), 0);
+    lv_obj_center(back_label);
+    
+    // 创建模式切换按钮
+    lv_obj_t* mode_btn = lv_btn_create(screen_chart);
+    lv_obj_set_size(mode_btn, 80, 30);
+    lv_obj_align(mode_btn, LV_ALIGN_TOP_RIGHT, -10, 10);
+    lv_obj_set_style_bg_color(mode_btn, lv_color_hex(0x3b82f6), 0);
+    lv_obj_set_style_bg_grad_color(mode_btn, lv_color_hex(0x2563eb), 0);
+    lv_obj_set_style_bg_grad_dir(mode_btn, LV_GRAD_DIR_VER, 0);
+    lv_obj_add_event_cb(mode_btn, chart_mode_event_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t* mode_label = lv_label_create(mode_btn);
+    lv_label_set_text(mode_label, "Each Fetch");
+    lv_obj_set_style_text_font(mode_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mode_label, lv_color_hex(0xffffff), 0);
+    lv_obj_center(mode_label);
+    
+    // 创建图表容器
+    lv_obj_t* chart_container = lv_obj_create(screen_chart);
+    lv_obj_set_size(chart_container, 300, 180);
+    lv_obj_align(chart_container, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_set_style_bg_color(chart_container, lv_color_hex(0x1e293b), 0);
+    lv_obj_set_style_border_color(chart_container, lv_color_hex(0x475569), 0);
+    lv_obj_set_style_border_width(chart_container, 1, 0);
+    lv_obj_set_style_radius(chart_container, 8, 0);
+    lv_obj_set_style_pad_all(chart_container, 10, 0);
+    
+    // 创建LVGL图表对象
+    chart_obj = lv_chart_create(chart_container);
+    lv_obj_set_size(chart_obj, 260, 140);  // 减小图表尺寸，为标签留出空间
+    lv_obj_center(chart_obj);
+    lv_chart_set_type(chart_obj, LV_CHART_TYPE_LINE);   // 设置为折线图
+    lv_chart_set_point_count(chart_obj, 10);           // 最多显示50个数据点
+    lv_chart_set_range(chart_obj, LV_CHART_AXIS_PRIMARY_Y, 0, 100);  // 初始Y轴范围
+    
+    // 禁用图表滚动功能和滚动条
+    lv_obj_clear_flag(chart_obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(chart_obj, LV_SCROLLBAR_MODE_OFF);
+    
+    // 设置图表样式
+    lv_obj_set_style_bg_color(chart_obj, lv_color_hex(0x0f172a), 0);
+    lv_obj_set_style_border_color(chart_obj, lv_color_hex(0x475569), 0);
+    lv_obj_set_style_border_width(chart_obj, 1, 0);
+    
+    // 设置网格线样式
+    lv_obj_set_style_line_color(chart_obj, lv_color_hex(0x374151), LV_PART_ITEMS);
+    lv_obj_set_style_line_width(chart_obj, 1, LV_PART_ITEMS);
+    
+    // 创建数据系列
+    chart_series = lv_chart_add_series(chart_obj, lv_color_hex(0x10b981), LV_CHART_AXIS_PRIMARY_Y);
+    
+    // 设置数据点样式
+    lv_obj_set_style_line_width(chart_obj, 3, LV_PART_ITEMS);
+    lv_obj_set_style_size(chart_obj, 6, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(chart_obj, lv_color_hex(0x10b981), LV_PART_INDICATOR);
+    
+    // 创建Y轴标签（纵轴）
+    lv_obj_t* y_axis_label = lv_label_create(chart_container);
+    lv_label_set_text(y_axis_label, "Stars");
+    lv_obj_set_style_text_font(y_axis_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(y_axis_label, lv_color_hex(0x94a3b8), 0);
+    lv_obj_align_to(y_axis_label, chart_obj, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+    lv_obj_set_style_transform_angle(y_axis_label, 900, 0);  // 旋转90度
+    
+    // 创建X轴标签（横轴）
+    lv_obj_t* x_axis_label = lv_label_create(chart_container);
+    lv_label_set_text(x_axis_label, "Time");
+    lv_obj_set_style_text_font(x_axis_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(x_axis_label, lv_color_hex(0x94a3b8), 0);
+    lv_obj_align_to(x_axis_label, chart_obj, LV_ALIGN_OUT_BOTTOM_MID, 0, 5);
+    
+    // 说明文本已删除，改为在数据点上显示具体数值
+    
+    Serial.println("图表界面创建完成");
 }
 
 /**
@@ -1687,6 +1816,14 @@ void createUI() {
     lv_obj_set_style_border_width(stars_container, 0, 0);
     lv_obj_set_style_radius(stars_container, 20, 0);
     lv_obj_clear_flag(stars_container, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // 添加点击事件处理
+    lv_obj_add_flag(stars_container, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(stars_container, stars_card_event_cb, LV_EVENT_CLICKED, NULL);
+    
+    // 添加按下效果样式
+    lv_obj_set_style_bg_color(stars_container, lv_color_hex(0x1e40af), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_grad_color(stars_container, lv_color_hex(0x2563eb), LV_STATE_PRESSED);
 
     lv_obj_t* stars_icon = lv_label_create(stars_container);
     lv_label_set_text(stars_icon, FA_STAR);
@@ -2015,14 +2152,24 @@ void fetchGitHubData() {
         
         if (error == DeserializationError::Ok) {
             // JSON解析成功，提取仓库统计数据
-            currentStars = doc["stargazers_count"];    // 获取Stars数量
-            currentForks = doc["forks_count"];         // 获取Forks数量
-            currentWatchers = doc["subscribers_count"]; // 获取Watchers数量
+            Serial.println("=== JSON解析调试信息 ===");
+            Serial.printf("JSON字段stargazers_count存在: %s\n", doc.containsKey("stargazers_count") ? "是" : "否");
+            Serial.printf("JSON字段是否为null: %s\n", doc["stargazers_count"].isNull() ? "是" : "否");
+            
+            currentStars = doc["stargazers_count"].as<int>();    // 明确转换为int类型
+            currentForks = doc["forks_count"].as<int>();         // 明确转换为int类型
+            currentWatchers = doc["subscribers_count"].as<int>(); // 明确转换为int类型
             
             Serial.println("JSON解析成功，获取到的数据:");
-            Serial.printf("  Stars: %d\n", currentStars);
+            Serial.printf("  Stars: %d (原始值: %s)\n", currentStars, doc["stargazers_count"].as<String>().c_str());
             Serial.printf("  Forks: %d\n", currentForks);
             Serial.printf("  Watchers: %d\n", currentWatchers);
+            Serial.printf("=== 准备保存星标数据: %d ===\n", currentStars);
+            
+            // 保存星标数据到文件系统
+            Serial.printf("=== 调用saveStarData前，currentStars值: %d ===\n", currentStars);
+            saveStarData(currentStars);
+            Serial.printf("=== 调用saveStarData后，currentStars值: %d ===\n", currentStars);
             
             // 完成进度条到100%
             lv_bar_set_value(progress_bar, 100, LV_ANIM_ON);
@@ -2033,6 +2180,11 @@ void fetchGitHubData() {
             showingUpdateSuccess = true;     // 标记正在显示更新成功状态
             updateSuccessTime = millis();    // 记录成功时间，用于3秒后恢复正常显示
             lv_label_set_text(time_label, "Last Upd: <1 min");  // 立即更新时间显示
+            
+            // 清除重试状态（数据获取成功）
+            waitingForRetry = false;
+            Serial.println("[DEBUG] 数据获取成功，清除重试状态");
+            
             Serial.println("UI状态已更新为'Update successful'");
         } else {
             // JSON解析失败
@@ -2048,21 +2200,37 @@ void fetchGitHubData() {
         String statusMessage = "";
         
         switch (httpCode) {
+            case -1:
+                statusMessage = "Connection Failed";
+                errorMessage = "Network connection failed.\nPossible causes:\n• WiFi signal is weak or unstable\n• DNS resolution failed\n• Internet connection is down\n• Router/firewall blocking requests\n\nTrying to reconnect in 10 seconds...";
+                // 设置重试机制
+                waitingForRetry = true;
+                retryTime = millis() + RETRY_INTERVAL;
+                Serial.println("[DEBUG] 设置重试机制，1秒后重新获取数据");
+                break;
             case 404:
                 statusMessage = "Repository not found";
                 errorMessage = "Repository not found.\nPlease check if the owner and repository name are correct.\nVerify your GitHub settings.";
+                // 清除重试状态（配置错误，不需要重试）
+                waitingForRetry = false;
                 break;
             case 401:
                 statusMessage = "Unauthorized access";
                 errorMessage = "GitHub Token is invalid or expired.\nPlease check your token in settings.\nEnsure the token has proper permissions.";
+                // 清除重试状态（认证错误，不需要重试）
+                waitingForRetry = false;
                 break;
             case 403:
                 statusMessage = "Access forbidden";
                 errorMessage = "GitHub Token is invalid or API rate limit exceeded.\nPlease check your token or try again later.\nVerify token permissions.";
+                // 清除重试状态（权限错误，不需要重试）
+                waitingForRetry = false;
                 break;
             case 429:
                 statusMessage = "Rate limit exceeded";
                 errorMessage = "API requests too frequent.\nPlease wait a moment and try again.\nConsider using a personal access token.";
+                // 清除重试状态（频率限制，不需要重试）
+                waitingForRetry = false;
                 break;
             case 500:
             case 502:
@@ -2436,6 +2604,29 @@ void setup() {
     Serial.println("初始化WiFi模块...");
     WiFi.mode(WIFI_STA);
     delay(100);
+    
+    // 初始化LittleFS文件系统，用于存储历史数据
+    Serial.println("初始化LittleFS文件系统...");
+    if (!LittleFS.begin()) {
+        Serial.println("LittleFS初始化失败，尝试格式化...");
+        if (LittleFS.format()) {
+            Serial.println("LittleFS格式化成功，重新初始化...");
+            if (LittleFS.begin()) {
+                Serial.println("LittleFS重新初始化成功");
+            } else {
+                Serial.println("LittleFS重新初始化失败！");
+            }
+        } else {
+            Serial.println("LittleFS格式化失败！");
+        }
+    } else {
+        Serial.println("LittleFS初始化成功");
+        // 检查文件系统状态
+        size_t totalBytes = LittleFS.totalBytes();
+        size_t usedBytes = LittleFS.usedBytes();
+        Serial.printf("文件系统状态: 总空间=%d字节, 已用=%d字节, 可用=%d字节\n", 
+                     totalBytes, usedBytes, totalBytes - usedBytes);
+    }
 
     // *** 新增代码：如果NVS中没有保存过配置，则从secrets.h加载默认值 ***
     if (strlen(ssid) == 0) {
@@ -2456,6 +2647,7 @@ void setup() {
     create_settings_screen();      // 创建设置主界面
     create_wifi_list_screen();     // 创建WiFi网络列表界面
     create_github_settings_screen(); // 创建GitHub配置界面
+    create_chart_screen();         // 创建数据可视化图表界面
     createUI(); // 创建主显示界面
 
     // 创建功能按钮（设置按钮、触摸测试按钮等）
@@ -2469,6 +2661,25 @@ void setup() {
     if (connectWiFi()) {
         // WiFi连接成功，配置时区并获取GitHub数据
         configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");  // 设置中国时区(UTC+8)
+        
+        // 等待NTP时间同步
+        Serial.println("等待NTP时间同步...");
+        struct tm timeinfo;
+        int attempts = 0;
+        while (!getLocalTime(&timeinfo) && attempts < 10) {
+            delay(1000);
+            attempts++;
+            Serial.printf("NTP同步尝试 %d/10\n", attempts);
+        }
+        
+        if (getLocalTime(&timeinfo)) {
+            Serial.println("NTP时间同步成功");
+            char timeStr[64];
+            strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+            Serial.printf("当前时间: %s\n", timeStr);
+        } else {
+            Serial.println("NTP时间同步失败，使用默认时间");
+        }
         
         // 延时2秒让用户看到"WiFi Connected"状态
         delay(2000);
@@ -2565,6 +2776,15 @@ void loop() {
         updateTimeDisplay();   // 立即更新时间显示为<1min
     }
     
+    // 处理重试机制（当HTTP错误码为-1时，10秒后重新获取数据）
+    if (waitingForRetry && currentMillis >= retryTime) {
+        Serial.println("[DEBUG] 重试时间到，重新获取GitHub数据");
+        waitingForRetry = false;
+        if (WiFi.status() == WL_CONNECTED && !isFetchingData) {
+            fetchGitHubData();
+        }
+    }
+    
     // 定时获取GitHub数据（每30分钟更新一次，仅在WiFi连接时执行）
     if (WiFi.status() == WL_CONNECTED && currentMillis - lastDataUpdate >= UPDATE_INTERVAL) {
         fetchGitHubData();           // 获取最新的GitHub仓库数据
@@ -2614,4 +2834,396 @@ void loop() {
     }
     
     wasConnected = currentlyConnected;  // 保存当前连接状态，用于下次比较
+}
+
+/**
+ * 保存星标数据到文件
+ * 参数：starCount - 当前星标数量
+ */
+void saveStarData(int starCount) {
+    Serial.println("=== 保存星标数据 ===");
+    Serial.printf("=== 接收到的starCount参数值: %d ===\n", starCount);
+    
+    // 获取当前时间戳
+    time_t now;
+    time(&now);
+    Serial.printf("=== 当前时间戳: %lu ===\n", now);
+    
+    // 打开文件进行追加写入
+    File file = LittleFS.open(DATA_FILE, "a");
+    if (!file) {
+        Serial.println("无法打开数据文件进行写入");
+        return;
+    }
+    
+    // 写入数据：时间戳,星标数量
+    Serial.printf("=== 准备写入文件: 时间戳=%lu, 星标=%d ===\n", (unsigned long)now, starCount);
+    file.printf("%lu,%d\n", (unsigned long)now, starCount);
+    file.close();
+    
+    Serial.printf("已保存数据: 时间戳=%lu, 星标=%d\n", now, starCount);
+    
+    // 检查文件大小，如果超过限制则清理旧数据
+    file = LittleFS.open(DATA_FILE, "r");
+    if (file) {
+        size_t fileSize = file.size();
+        file.close();
+        
+        // 如果文件超过10KB，保留最新的50%数据
+        if (fileSize > 10240) {
+            Serial.println("数据文件过大，清理旧数据...");
+            cleanupOldData();
+        }
+    }
+}
+
+/**
+ * 清理旧数据，保留最新的一半数据
+ */
+void cleanupOldData() {
+    File file = LittleFS.open(DATA_FILE, "r");
+    if (!file) return;
+    
+    // 读取所有行到临时数组
+    String lines[200];  // 最多保存200行
+    int lineCount = 0;
+    
+    while (file.available() && lineCount < 200) {
+        lines[lineCount] = file.readStringUntil('\n');
+        lineCount++;
+    }
+    file.close();
+    
+    // 保留后一半数据
+    int keepFrom = lineCount / 2;
+    
+    // 重写文件
+    file = LittleFS.open(DATA_FILE, "w");
+    if (file) {
+        for (int i = keepFrom; i < lineCount; i++) {
+            file.println(lines[i]);
+        }
+        file.close();
+        Serial.printf("数据清理完成，保留了 %d 行数据\n", lineCount - keepFrom);
+    }
+}
+
+/**
+ * 加载图表数据
+ * 功能：从文件系统读取历史数据并根据显示模式处理
+ */
+void loadChartData() {
+    Serial.println("=== 加载图表数据 ===");
+    
+    // 清空现有数据
+    chart_data_count = 0;
+    
+    File file = LittleFS.open(DATA_FILE, "r");
+    if (!file) {
+        Serial.println("数据文件不存在");
+        return;
+    }
+    
+    // 临时存储所有数据点
+    struct DataPoint {
+        time_t timestamp;
+        int stars;
+    };
+    
+    DataPoint allData[200];  // 最多读取200个数据点
+    int totalCount = 0;
+    
+    // 读取所有数据
+    while (file.available() && totalCount < 200) {
+        String line = file.readStringUntil('\n');
+        line.trim();
+        
+        if (line.length() > 0) {
+            int commaIndex = line.indexOf(',');
+            if (commaIndex > 0) {
+                allData[totalCount].timestamp = line.substring(0, commaIndex).toInt();
+                allData[totalCount].stars = line.substring(commaIndex + 1).toInt();
+                totalCount++;
+            }
+        }
+    }
+    file.close();
+    
+    Serial.printf("读取到 %d 个数据点\n", totalCount);
+    
+    if (totalCount == 0) {
+        Serial.println("没有可用的历史数据");
+        return;
+    }
+    
+    // 根据显示模式处理数据
+    if (chart_view_mode == 0) {
+        // 模式0：每次获取数据（显示最近10个点）
+        int startIndex = (totalCount > 10) ? totalCount - 10 : 0;
+        for (int i = startIndex; i < totalCount; i++) {
+            chart_data[chart_data_count] = allData[i].stars;
+            chart_data_count++;
+        }
+    } else if (chart_view_mode == 1) {
+        // 模式1：每天数据（按天聚合，显示最近7天）
+        time_t lastDay = 0;
+        int dailyData[7];
+        int dailyCount = 0;
+        
+        // 从最新数据开始，向前查找7天的数据
+        for (int i = totalCount - 1; i >= 0 && dailyCount < 7; i--) {
+            time_t currentDay = allData[i].timestamp / 86400;  // 转换为天数
+            if (currentDay != lastDay) {
+                dailyData[dailyCount] = allData[i].stars;
+                dailyCount++;
+                lastDay = currentDay;
+            }
+        }
+        
+        // 反转数组，使时间顺序正确
+        for (int i = dailyCount - 1; i >= 0; i--) {
+            chart_data[chart_data_count] = dailyData[i];
+            chart_data_count++;
+        }
+    } else if (chart_view_mode == 2) {
+        // 模式2：增长数据（显示最近10个点的增长）
+        if (totalCount > 1) {
+            int startIndex = (totalCount > 10) ? totalCount - 10 : 0;
+            int baseStars = (startIndex > 0) ? allData[startIndex - 1].stars : allData[0].stars;
+            
+            for (int i = startIndex; i < totalCount; i++) {
+                int growth = allData[i].stars - baseStars;
+                chart_data[chart_data_count] = growth;
+                chart_data_count++;
+            }
+        }
+    }
+    
+    Serial.printf("处理后的数据点数量: %d\n", chart_data_count);
+}
+
+/**
+ * 更新图表显示
+ * 功能：将数据应用到LVGL图表控件，并添加数据点标签和横坐标标签
+ */
+void updateChartDisplay() {
+    if (chart_obj == NULL || chart_series == NULL) {
+        Serial.println("图表对象未初始化");
+        return;
+    }
+    
+    // 清除现有数据点标签
+    lv_obj_t* parent = lv_obj_get_parent(chart_obj);
+    lv_obj_t* child = lv_obj_get_child(parent, 0);
+    while (child != NULL) {
+        lv_obj_t* next = lv_obj_get_child(parent, lv_obj_get_index(child) + 1);
+        if (child != chart_obj && lv_obj_check_type(child, &lv_label_class)) {
+            // 检查是否是数据点标签或坐标轴标签（通过用户数据标识）
+            void* user_data = lv_obj_get_user_data(child);
+            if (user_data == (void*)0x1234 || user_data == (void*)0x5678) {
+                lv_obj_del(child);
+            }
+        }
+        child = next;
+    }
+    
+    // 清除现有数据
+    lv_chart_set_point_count(chart_obj, chart_data_count);
+    
+    // 设置数据
+    for (int i = 0; i < chart_data_count; i++) {
+        lv_chart_set_next_value(chart_obj, chart_series, chart_data[i]);
+    }
+    
+    // 自动调整Y轴范围
+    if (chart_data_count > 0) {
+        int minVal = chart_data[0];
+        int maxVal = chart_data[0];
+        
+        for (int i = 1; i < chart_data_count; i++) {
+            if (chart_data[i] < minVal) minVal = chart_data[i];
+            if (chart_data[i] > maxVal) maxVal = chart_data[i];
+        }
+        
+        // 添加一些边距
+        int range = maxVal - minVal;
+        int margin = range * 0.1;  // 10%边距
+        if (margin < 1) margin = 1;
+        
+        lv_chart_set_range(chart_obj, LV_CHART_AXIS_PRIMARY_Y, minVal - margin, maxVal + margin);
+        
+        // 添加数据点标签
+        lv_area_t chart_area;
+        lv_obj_get_coords(chart_obj, &chart_area);
+        int chart_width = lv_area_get_width(&chart_area);
+        int chart_height = lv_area_get_height(&chart_area);
+        
+        // 定义容器边界变量（避免重复声明）
+        lv_coord_t container_left_narrow = chart_area.x1 - 10;  // 数据点标签边界
+        lv_coord_t container_right_narrow = chart_area.x2 + 10;
+        lv_coord_t container_top = chart_area.y1 - 30;
+        lv_coord_t container_left_wide = chart_area.x1 - 20;    // 横坐标标签边界
+        lv_coord_t container_right_wide = chart_area.x2 + 20;
+        
+        for (int i = 0; i < chart_data_count; i++) {
+            // 计算数据点在图表中的位置
+            int x_pos;
+            if (chart_data_count == 1) {
+                // 只有一个数据点时，放在图表中央
+                x_pos = chart_area.x1 + chart_width / 2;
+            } else {
+                // 多个数据点时，均匀分布
+                x_pos = chart_area.x1 + (i * chart_width) / (chart_data_count - 1);
+            }
+            int y_pos;
+            if (maxVal - minVal + 2 * margin == 0) {
+                // 防止除零错误，当所有数据点相同时
+                y_pos = chart_area.y1 + chart_height / 2;
+            } else {
+                y_pos = chart_area.y2 - ((chart_data[i] - minVal + margin) * chart_height) / (maxVal - minVal + 2 * margin);
+            }
+            
+            // 创建数据点数值标签
+            lv_obj_t* value_label = lv_label_create(parent);
+            lv_label_set_text_fmt(value_label, "%d", chart_data[i]);
+            lv_obj_set_style_text_font(value_label, &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_color(value_label, lv_color_hex(0xfbbf24), 0);
+            // 获取标签尺寸以实现精确居中
+            lv_obj_update_layout(value_label);
+            lv_coord_t label_width = lv_obj_get_width(value_label);
+            lv_coord_t label_height = lv_obj_get_height(value_label);
+            // 精确居中对齐：x坐标减去标签宽度的一半，y坐标向上偏移
+            lv_coord_t value_label_x = x_pos - label_width / 2;
+            lv_coord_t value_label_y = y_pos - label_height - 8;
+            // 限制标签位置不超出图表容器范围
+            if (value_label_x < container_left_narrow) value_label_x = container_left_narrow;
+            if (value_label_x + label_width > container_right_narrow) value_label_x = container_right_narrow - label_width;
+            if (value_label_y < container_top) value_label_y = container_top;
+            lv_obj_set_pos(value_label, value_label_x, value_label_y);
+            lv_obj_set_user_data(value_label, (void*)0x1234);  // 标记为数据点标签
+            
+            // 创建横坐标标签
+            lv_obj_t* x_label = lv_label_create(parent);
+            lv_obj_set_style_text_font(x_label, &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_color(x_label, lv_color_hex(0x94a3b8), 0);
+            lv_obj_set_user_data(x_label, (void*)0x5678);  // 标记为坐标轴标签
+            
+            // 根据图表模式设置横坐标标签文本
+            if (chart_view_mode == 0) {
+                // 每次获取模式：最新的显示"now"，其他显示序号
+                if (i == chart_data_count - 1) {
+                    lv_label_set_text(x_label, "now");
+                } else {
+                    lv_label_set_text_fmt(x_label, "-%d", chart_data_count - 1 - i);
+                }
+            } else if (chart_view_mode == 1) {
+                // 每日数据模式：显示星期
+                const char* weekdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+                // 假设最新的是今天，向前推算
+                time_t now = time(NULL);
+                struct tm* timeinfo = localtime(&now);
+                int today_weekday = timeinfo->tm_wday;
+                int day_offset = chart_data_count - 1 - i;
+                int weekday = (today_weekday - day_offset + 7) % 7;
+                lv_label_set_text(x_label, weekdays[weekday]);
+            } else if (chart_view_mode == 2) {
+                // 增长数据模式：显示增长点序号
+                lv_label_set_text_fmt(x_label, "G%d", i + 1);
+            }
+            
+            // 获取横坐标标签尺寸以实现精确居中
+            lv_obj_update_layout(x_label);
+            lv_coord_t x_label_width = lv_obj_get_width(x_label);
+            // 精确居中对齐：x坐标减去标签宽度的一半
+            // 限制标签位置不超出图表容器范围
+            lv_coord_t x_label_x = x_pos - x_label_width / 2;
+            if (x_label_x < container_left_wide) x_label_x = container_left_wide;
+            if (x_label_x + x_label_width > container_right_wide) x_label_x = container_right_wide - x_label_width;
+            lv_obj_set_pos(x_label, x_label_x, chart_area.y2 + 8);
+        }
+    }
+    
+    lv_obj_invalidate(chart_obj);  // 刷新图表显示
+}
+
+/**
+ * 星星卡片点击事件回调函数
+ * 功能：处理星星卡片的点击事件，切换到图表界面
+ */
+static void stars_card_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    
+    if (code == LV_EVENT_CLICKED) {
+        Serial.println("星星卡片被点击，切换到图表界面");
+        
+        // 创建图表界面（如果尚未创建）
+        if (screen_chart == NULL) {
+            create_chart_screen();
+        }
+        
+        // 加载图表数据
+        loadChartData();
+        
+        // 更新图表显示
+        updateChartDisplay();
+        
+        // 切换到图表界面
+        lv_scr_load_anim(screen_chart, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+        
+        // 隐藏设置和刷新按钮
+        control_buttons_visibility(screen_chart);
+    }
+}
+
+/**
+ * 图表界面返回按钮事件回调函数
+ * 功能：从图表界面返回到主界面
+ */
+static void chart_back_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    
+    if (code == LV_EVENT_CLICKED) {
+        Serial.println("图表界面返回按钮被点击");
+        
+        // 切换回主界面
+        lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+        
+        // 恢复设置和刷新按钮显示
+        control_buttons_visibility(main_screen);
+    }
+}
+
+/**
+ * 图表模式切换事件回调函数
+ * 功能：切换图表的显示模式（每次获取/每天/增长）
+ */
+static void chart_mode_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    
+    if (code == LV_EVENT_CLICKED) {
+        // 切换到下一个模式
+        chart_view_mode = (chart_view_mode + 1) % 3;
+        
+        Serial.printf("切换图表模式到: %d\n", chart_view_mode);
+        
+        // 重新加载和显示数据
+        loadChartData();
+        updateChartDisplay();
+        
+        // 更新模式按钮文本
+        lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+        lv_obj_t* label = lv_obj_get_child(btn, 0);
+        
+        switch (chart_view_mode) {
+            case 0:
+                lv_label_set_text(label, "Each Fetch");
+                break;
+            case 1:
+                lv_label_set_text(label, "Daily Data");
+                break;
+            case 2:
+                lv_label_set_text(label, "Growth Data");
+                break;
+        }
+    }
 }
