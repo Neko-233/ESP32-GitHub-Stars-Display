@@ -177,6 +177,8 @@ char githubToken[65] = "";          // GitHub访问令牌：最大64字符+结�
 // ===== 全局状态变量 =====
 // GitHub仓库数据状态
 int currentStars = -1, currentForks = -1, currentWatchers = -1;  // 当前显示的星标、分支、关注者数量（-1表示未获取）
+int yesterdayStars = -1;  // 昨日星标数量（用于计算变化量）
+int starsDelta = 0;       // 星标变化量（今日-昨日）
 
 // 时间管理变量
 unsigned long lastDataUpdate = 0;        // 上次数据更新时间戳（毫秒）
@@ -223,7 +225,9 @@ lv_obj_t *screen_edit_token;        // 编辑GitHub令牌界面
 lv_obj_t *screen_chart;             // 数据可视化图表界面
 // ===== 主界面UI组件对象 =====
 lv_obj_t *title_label;          // 标题标签：显示仓库名称（所有者/仓库名）
+lv_obj_t *current_time_label;   // 当前时间标签：显示实时时间
 lv_obj_t *stars_count_label;    // 星标数量标签：显示GitHub星标数
+lv_obj_t *stars_delta_label;    // 星标变化量标签：显示今日vs昨日的变化（+/-数字）
 lv_obj_t *forks_label;          // 分支数量标签：显示GitHub分支数
 lv_obj_t *watchers_label;       // 关注者数量标签：显示GitHub关注者数
 lv_obj_t *status_label;         // 状态标签：显示连接状态、错误信息等
@@ -269,6 +273,7 @@ void updateChartDisplay();                                    // 更新图表显
 // 显示更新函数
 void updateStatus(const char *message, lv_color_t color);     // 更新状态标签显示
 void showCurrentTime();                                       // 显示当前时间
+void updateCurrentTimeDisplay();                              // 更新当前时间显示
 void updateTimeDisplay();                                     // 更新时间标签显示
 void updateProgressBar();                                     // 更新进度条显示
 
@@ -1805,7 +1810,14 @@ void createUI() {
     lv_label_set_text(title_label, repoName);
     lv_obj_set_style_text_color(title_label, lv_color_hex(0xffffff), 0);
     lv_obj_set_style_text_font(title_label, &lv_font_montserrat_20, 0);
-    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 5);
+
+    // --- 时间显示区域 ---
+    current_time_label = lv_label_create(main_screen);
+    lv_label_set_text(current_time_label, "--:--:--");
+    lv_obj_set_style_text_color(current_time_label, lv_color_hex(0x9ca3af), 0);
+    lv_obj_set_style_text_font(current_time_label, &lv_font_montserrat_16, 0);
+    lv_obj_align_to(current_time_label, title_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 5);
 
     // --- 主要星星显示区域 ---
     lv_obj_t* stars_container = lv_obj_create(main_screen);
@@ -1829,13 +1841,20 @@ void createUI() {
     lv_label_set_text(stars_icon, FA_STAR);
     lv_obj_set_style_text_font(stars_icon, &font_awesome_16, 0);
     lv_obj_set_style_text_color(stars_icon, lv_color_hex(0xfbbf24), 0);
-    lv_obj_align(stars_icon, LV_ALIGN_CENTER, -50, -10);
+    lv_obj_align(stars_icon, LV_ALIGN_CENTER, -80, -5);
     
     stars_count_label = lv_label_create(stars_container);
     lv_label_set_text(stars_count_label, "---");
     lv_obj_set_style_text_color(stars_count_label, lv_color_hex(0xfbbf24), 0);
-    lv_obj_set_style_text_font(stars_count_label, &lv_font_montserrat_40, 0);
-    lv_obj_align(stars_count_label, LV_ALIGN_CENTER, 10, -10);
+    lv_obj_set_style_text_font(stars_count_label, &lv_font_montserrat_48, 0);
+    lv_obj_align(stars_count_label, LV_ALIGN_CENTER, 10, -5);
+
+    // 星标变化量标签
+    stars_delta_label = lv_label_create(stars_container);
+    lv_label_set_text(stars_delta_label, "");
+    lv_obj_set_style_text_color(stars_delta_label, lv_color_hex(0x9ca3af), 0);
+    lv_obj_set_style_text_font(stars_delta_label, &lv_font_montserrat_12, 0);
+    lv_obj_align(stars_delta_label, LV_ALIGN_BOTTOM_LEFT, 10, -5);
 
     lv_obj_t* stars_text_label = lv_label_create(stars_container);
     lv_label_set_text(stars_text_label, "STARS");
@@ -1926,6 +1945,7 @@ void load_settings() {
     preferences.getString("repoOwner", repoOwner, sizeof(repoOwner)); // GitHub仓库所有者
     preferences.getString("repoName", repoName, sizeof(repoName));   // GitHub仓库名称
     preferences.getString("githubToken", githubToken, sizeof(githubToken)); // GitHub访问令牌
+    yesterdayStars = preferences.getInt("yesterdayStars", -1);   // 昨日星标数量
     preferences.end();  // 关闭NVS访问
     
     Serial.println("加载的设置:");
@@ -1953,6 +1973,7 @@ void save_settings() {
     preferences.putString("repoOwner", repoOwner); // 保存GitHub仓库所有者
     preferences.putString("repoName", repoName);   // 保存GitHub仓库名称
     preferences.putString("githubToken", githubToken); // 保存GitHub访问令牌
+    preferences.putInt("yesterdayStars", yesterdayStars); // 保存昨日星标数量
     preferences.end();  // 关闭NVS访问，确保数据写入Flash
     
     Serial.println("保存的设置:");
@@ -2166,6 +2187,9 @@ void fetchGitHubData() {
             Serial.printf("  Watchers: %d\n", currentWatchers);
             Serial.printf("=== 准备保存星标数据: %d ===\n", currentStars);
             
+            // 检查是否是新的一天并更新昨日数据
+            checkAndUpdateDailyData();
+            
             // 保存星标数据到文件系统
             Serial.printf("=== 调用saveStarData前，currentStars值: %d ===\n", currentStars);
             saveStarData(currentStars);
@@ -2357,6 +2381,60 @@ void animatePlaceholderToNumber(lv_obj_t* label) {
 }
 
 /**
+ * 检查是否是新的一天并更新昨日数据
+ * 功能：检测日期变化，将当前星标数设为昨日星标数
+ * 特点：使用NVS存储上次检查的日期，确保跨重启的日期检测
+ */
+void checkAndUpdateDailyData() {
+    time_t now;
+    time(&now);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    
+    // 获取当前日期（年月日）
+    int currentDay = timeinfo.tm_year * 10000 + timeinfo.tm_mon * 100 + timeinfo.tm_mday;
+    
+    // 从NVS读取上次检查的日期
+    preferences.begin("gh-display", false);
+    int lastCheckDay = preferences.getInt("lastCheckDay", 0);
+    
+    if (lastCheckDay != currentDay && currentStars >= 0) {
+        // 新的一天，更新昨日数据
+        Serial.printf("检测到新的一天，更新昨日星标数: %d -> %d\n", yesterdayStars, currentStars);
+        yesterdayStars = currentStars;
+        preferences.putInt("yesterdayStars", yesterdayStars);
+        preferences.putInt("lastCheckDay", currentDay);
+    }
+    
+    preferences.end();
+}
+
+/**
+ * 更新星标变化量显示
+ * 功能：显示星标增长量，使用简单的+数字格式
+ * 特点：有增长显示红色+号，无昨日数据显示-号
+ */
+void updateStarsDelta() {
+    if (currentStars >= 0 && yesterdayStars >= 0) {
+        starsDelta = currentStars - yesterdayStars;
+        
+        if (starsDelta >= 0) {
+            lv_label_set_text_fmt(stars_delta_label, "+%d", starsDelta);
+            lv_obj_set_style_text_color(stars_delta_label, lv_color_hex(0xef4444), 0); // 红色
+        }
+        
+        Serial.printf("星标变化量: %d (今日: %d, 昨日: %d)\n", starsDelta, currentStars, yesterdayStars);
+    } else if (currentStars >= 0) {
+        // 有当前数据但没有昨日数据，显示-号表示无历史数据
+        lv_label_set_text(stars_delta_label, "-");
+        lv_obj_set_style_text_color(stars_delta_label, lv_color_hex(0x9ca3af), 0); // 灰色
+    } else {
+        // 没有任何数据
+        lv_label_set_text(stars_delta_label, "");
+    }
+}
+
+/**
  * 更新主显示界面的数据
  * 功能：将获取到的GitHub仓库数据更新到UI标签上
  * 包括：Stars数量、Forks数量、Watchers数量
@@ -2377,6 +2455,9 @@ void updateDisplay() {
         lv_label_set_text(stars_count_label, "---");  // 数据无效时显示占位符
         animatingStars = -1;  // 重置动画状态
     }
+    
+    // 更新星标变化量显示
+    updateStarsDelta();
     
     // 更新Forks数量显示
     if (currentForks >= 0) {
@@ -2474,6 +2555,23 @@ void showCurrentTime() {
         char timeStr[20];
         strftime(timeStr, sizeof(timeStr), "CST %H:%M", &timeinfo);  // 格式化时间字符串
         updateStatus(timeStr, lv_color_hex(0x60a5fa));  // 以蓝色显示时间
+    }
+}
+
+/**
+ * 更新当前时间显示函数
+ * 功能：更新标题下方的实时时间显示
+ * 格式："HH:MM:SS"（如：14:30:25）
+ * 特点：每秒更新一次，显示完整的时分秒
+ */
+void updateCurrentTimeDisplay() {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {  // 尝试获取本地时间
+        char timeStr[10];
+        strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);  // 格式化时间字符串
+        lv_label_set_text(current_time_label, timeStr);  // 更新时间显示
+    } else {
+        lv_label_set_text(current_time_label, "--:--:--");  // 无法获取时间时显示占位符
     }
 }
 
@@ -2599,6 +2697,9 @@ void setup() {
 
     // 从NVS（非易失性存储）加载用户配置（WiFi凭据、GitHub设置等）
     load_settings();
+    
+    // 检查是否是新的一天并更新昨日数据
+    checkAndUpdateDailyData();
     
     // 初始化WiFi模块，设置为Station模式（客户端模式）
     Serial.println("初始化WiFi模块...");
@@ -2789,6 +2890,13 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED && currentMillis - lastDataUpdate >= UPDATE_INTERVAL) {
         fetchGitHubData();           // 获取最新的GitHub仓库数据
         lastDataUpdate = currentMillis;  // 更新最后数据获取时间
+    }
+    
+    // 定时更新当前时间显示（每秒更新一次）
+    static unsigned long lastCurrentTimeUpdate = 0;
+    if (currentMillis - lastCurrentTimeUpdate >= 1000) {
+        updateCurrentTimeDisplay();  // 更新标题下方的实时时间显示
+        lastCurrentTimeUpdate = currentMillis;
     }
     
     // 定时更新时间显示（每分钟更新一次"Last Upd"信息）
