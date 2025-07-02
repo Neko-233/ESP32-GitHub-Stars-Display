@@ -223,6 +223,8 @@ lv_obj_t *screen_edit_token;        // 编辑GitHub令牌界面
 
 // 数据可视化界面
 lv_obj_t *screen_chart;             // 数据可视化图表界面
+lv_obj_t *screen_weather;           // 天气信息界面
+lv_obj_t *screen_calendar;          // 日历界面
 // ===== 主界面UI组件对象 =====
 lv_obj_t *title_label;          // 标题标签：显示仓库名称（所有者/仓库名）
 lv_obj_t *current_time_label;   // 当前时间标签：显示实时时间
@@ -267,6 +269,8 @@ void create_edit_owner_screen();                              // 创建编辑仓
 void create_edit_repo_screen();                               // 创建编辑仓库名称界面
 void create_edit_token_screen();                              // 创建编辑GitHub令牌界面
 void create_chart_screen();                                   // 创建数据可视化图表界面
+void create_weather_screen();                                 // 创建天气信息界面
+void create_calendar_screen();                                // 创建日历界面
 
 // 数据管理函数
 void load_settings();                                         // 从NVS加载配置设置
@@ -1807,11 +1811,51 @@ void create_edit_token_screen() {
     lv_obj_add_event_cb(ta, ta_event_cb, LV_EVENT_CLICKED, NULL);
 }
 
+/**
+ * 主界面滑动手势事件回调函数
+ * 功能：处理主界面的左右滑动手势，实现天气和日历界面的切换
+ * 参数：e - LVGL事件对象
+ */
+static void main_screen_gesture_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    
+    if (code == LV_EVENT_GESTURE) {
+        lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+        
+        if (dir == LV_DIR_LEFT) {
+            // 左滑显示日历界面
+            Serial.println("主界面左滑，切换到日历界面");
+            // 删除旧的日历界面（如果存在）
+            if (screen_calendar != NULL) {
+                lv_obj_del(screen_calendar);
+                screen_calendar = NULL;
+            }
+            // 重新创建日历界面
+            create_calendar_screen();
+            lv_scr_load_anim(screen_calendar, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+            control_buttons_visibility(screen_calendar);
+        }
+        else if (dir == LV_DIR_RIGHT) {
+            // 右滑显示天气界面
+            Serial.println("主界面右滑，切换到天气界面");
+            if (screen_weather == NULL) {
+                create_weather_screen();
+            }
+            lv_scr_load_anim(screen_weather, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+            control_buttons_visibility(screen_weather);
+        }
+    }
+}
+
 void createUI() {
     main_screen = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(main_screen, lv_color_hex(0x0a0a0a), 0);
     lv_obj_set_style_bg_grad_color(main_screen, lv_color_hex(0x1a1a2e), 0);
     lv_obj_set_style_bg_grad_dir(main_screen, LV_GRAD_DIR_VER, 0);
+    
+    // 添加滑动手势支持
+    lv_obj_add_event_cb(main_screen, main_screen_gesture_event_cb, LV_EVENT_GESTURE, NULL);
+    lv_obj_clear_flag(main_screen, LV_OBJ_FLAG_GESTURE_BUBBLE);
     
     // --- 标题区域 ---
     title_label = lv_label_create(main_screen);
@@ -1839,7 +1883,7 @@ void createUI() {
     
     // 添加点击事件处理
     lv_obj_add_flag(stars_container, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(stars_container, stars_card_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(stars_container, stars_card_event_cb, LV_EVENT_LONG_PRESSED, NULL);
     
     // 添加按下效果样式
     lv_obj_set_style_bg_color(stars_container, lv_color_hex(0x1e40af), LV_STATE_PRESSED);
@@ -1934,6 +1978,297 @@ void createUI() {
     lv_obj_add_flag(progress_bar, LV_OBJ_FLAG_HIDDEN);
 
     Serial.println("UI创建完成。");
+}
+
+/**
+ * 创建天气信息界面
+ * 功能：显示当前天气信息、温度、湿度等数据
+ */
+void create_weather_screen() {
+    Serial.println("=== 创建天气界面 ===");
+    
+    // 创建天气屏幕
+    screen_weather = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(screen_weather, lv_color_hex(0x0f172a), 0);  // 深蓝色背景
+    lv_obj_set_style_bg_grad_color(screen_weather, lv_color_hex(0x1e3a8a), 0);  // 渐变色
+    lv_obj_set_style_bg_grad_dir(screen_weather, LV_GRAD_DIR_VER, 0);
+    
+    // 添加滑动手势支持（返回主界面）
+    lv_obj_add_event_cb(screen_weather, [](lv_event_t * e) {
+        lv_event_code_t code = lv_event_get_code(e);
+        if (code == LV_EVENT_GESTURE) {
+            lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+            if (dir == LV_DIR_LEFT) {
+                Serial.println("天气界面左滑，返回主界面");
+                if (main_screen != NULL) {
+                    lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+                    control_buttons_visibility(main_screen);
+                } else {
+                    Serial.println("错误：main_screen为NULL");
+                }
+            }
+        }
+    }, LV_EVENT_GESTURE, NULL);
+    lv_obj_clear_flag(screen_weather, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    
+    // 获取当前时间用于显示日期
+    struct tm timeinfo;
+    bool time_valid = false;
+    
+    // 检查WiFi连接状态和时间同步
+    if (WiFi.status() == WL_CONNECTED) {
+        time_valid = getLocalTime(&timeinfo);
+        if (!time_valid) {
+            // 如果NTP时间获取失败，尝试重新配置时间
+            Serial.println("天气界面：NTP时间获取失败，尝试重新同步");
+            configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+            delay(1000);
+            time_valid = getLocalTime(&timeinfo);
+        }
+    }
+    
+    // 创建日期显示（在屏幕顶部）
+    lv_obj_t* date_label = lv_label_create(screen_weather);
+    if (time_valid) {
+        char date_str[20];
+        strftime(date_str, sizeof(date_str), "%Y-%m-%d", &timeinfo);
+        lv_label_set_text(date_label, date_str);
+    } else {
+        if (WiFi.status() != WL_CONNECTED) {
+            lv_label_set_text(date_label, "No WiFi Connection");
+        } else {
+            lv_label_set_text(date_label, "Time Sync Failed");
+        }
+    }
+    lv_obj_set_style_text_font(date_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(date_label, lv_color_hex(0xfbbf24), 0);
+    lv_obj_align(date_label, LV_ALIGN_TOP_MID, 0, 10);
+    
+    // 创建星期显示（在日期下方）
+    lv_obj_t* weekday_label = lv_label_create(screen_weather);
+    if (time_valid) {
+        const char* weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+        lv_label_set_text(weekday_label, weekdays[timeinfo.tm_wday]);
+    } else {
+        if (WiFi.status() != WL_CONNECTED) {
+            lv_label_set_text(weekday_label, "Connect WiFi in Settings");
+        } else {
+            lv_label_set_text(weekday_label, "Waiting for time sync...");
+        }
+    }
+    lv_obj_set_style_text_font(weekday_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(weekday_label, lv_color_hex(0xe5e7eb), 0);
+    lv_obj_align(weekday_label, LV_ALIGN_TOP_MID, 0, 30);
+    
+    // 创建天气标题
+    lv_obj_t* title_label = lv_label_create(screen_weather);
+    lv_label_set_text(title_label, LV_SYMBOL_SETTINGS " Weather");
+    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(title_label, lv_color_hex(0xf1f5f9), 0);
+    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 55);
+    
+    // 创建天气信息容器（缩小尺寸）
+    lv_obj_t* weather_container = lv_obj_create(screen_weather);
+    lv_obj_set_size(weather_container, 260, 140);
+    lv_obj_align(weather_container, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_set_style_bg_color(weather_container, lv_color_hex(0x1a1a2e), 0);
+    lv_obj_set_style_border_width(weather_container, 0, 0);
+    lv_obj_set_style_radius(weather_container, 20, 0);
+    lv_obj_clear_flag(weather_container, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // 温度显示
+    lv_obj_t* temp_label = lv_label_create(weather_container);
+    lv_label_set_text(temp_label, "25°C");
+    lv_obj_set_style_text_font(temp_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(temp_label, lv_color_hex(0xfbbf24), 0);
+    lv_obj_align(temp_label, LV_ALIGN_CENTER, 0, -20);
+    
+    // 天气状况
+    lv_obj_t* condition_label = lv_label_create(weather_container);
+    lv_label_set_text(condition_label, "Sunny");
+    lv_obj_set_style_text_font(condition_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(condition_label, lv_color_hex(0xe5e7eb), 0);
+    lv_obj_align(condition_label, LV_ALIGN_CENTER, 0, 20);
+    
+    // 湿度信息
+    lv_obj_t* humidity_label = lv_label_create(weather_container);
+    lv_label_set_text(humidity_label, "Humidity: 65%");
+    lv_obj_set_style_text_font(humidity_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(humidity_label, lv_color_hex(0x9ca3af), 0);
+    lv_obj_align(humidity_label, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+    
+    // 风速信息
+    lv_obj_t* wind_label = lv_label_create(weather_container);
+    lv_label_set_text(wind_label, "Wind: 5 km/h");
+    lv_obj_set_style_text_font(wind_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(wind_label, lv_color_hex(0x9ca3af), 0);
+    lv_obj_align(wind_label, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+    
+    // 提示信息
+    lv_obj_t* hint_label = lv_label_create(screen_weather);
+    lv_label_set_text(hint_label, "Swipe left to return to main screen");
+    lv_obj_set_style_text_font(hint_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint_label, lv_color_hex(0x6b7280), 0);
+    lv_obj_align(hint_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+    
+    Serial.println("天气界面创建完成");
+}
+
+/**
+ * 创建日历界面
+ * 功能：显示当前日期、月历视图等信息
+ */
+void create_calendar_screen() {
+    Serial.println("=== 创建日历界面 ===");
+    
+    // 创建日历屏幕
+    screen_calendar = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(screen_calendar, lv_color_hex(0x0a0a0a), 0);  // 与主页相同的背景色
+    lv_obj_set_style_bg_grad_color(screen_calendar, lv_color_hex(0x1a1a2e), 0);  // 与主页相同的渐变色
+    lv_obj_set_style_bg_grad_dir(screen_calendar, LV_GRAD_DIR_VER, 0);
+    
+    // 添加滑动手势支持（返回主界面）
+    lv_obj_add_event_cb(screen_calendar, [](lv_event_t * e) {
+        lv_event_code_t code = lv_event_get_code(e);
+        if (code == LV_EVENT_GESTURE) {
+            lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+            if (dir == LV_DIR_RIGHT) {
+                Serial.println("日历界面右滑，返回主界面");
+                if (main_screen != NULL) {
+                    lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+                    control_buttons_visibility(main_screen);
+                } else {
+                    Serial.println("错误：main_screen为NULL");
+                }
+            }
+        }
+    }, LV_EVENT_GESTURE, NULL);
+    lv_obj_clear_flag(screen_calendar, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    
+    // 创建标题
+    lv_obj_t* title_label = lv_label_create(screen_calendar);
+    lv_label_set_text(title_label, "Calendar");
+    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title_label, lv_color_hex(0xf1f5f9), 0);
+    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 15);
+    
+    // 获取当前真实时间（统一声明）
+    struct tm timeinfo;
+    bool time_valid = false;
+    
+    // 检查WiFi连接状态和时间同步
+    if (WiFi.status() == WL_CONNECTED) {
+        time_valid = getLocalTime(&timeinfo);
+        if (!time_valid) {
+            // 如果NTP时间获取失败，尝试重新配置时间
+            Serial.println("日历界面：NTP时间获取失败，尝试重新同步");
+            configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+            delay(1000);
+            time_valid = getLocalTime(&timeinfo);
+        }
+    }
+    
+    // 创建合并的日历容器（包含日期显示和月历）
+    lv_obj_t* calendar_container = lv_obj_create(screen_calendar);
+    lv_obj_set_size(calendar_container, 280, 220);
+    lv_obj_align(calendar_container, LV_ALIGN_CENTER, 0, -20);
+    lv_obj_set_style_bg_color(calendar_container, lv_color_hex(0x1a1a2e), 0);
+    lv_obj_set_style_border_width(calendar_container, 0, 0);
+    lv_obj_set_style_radius(calendar_container, 20, 0);
+    lv_obj_clear_flag(calendar_container, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // 当前日期显示
+    lv_obj_t* date_label = lv_label_create(calendar_container);
+    if (time_valid) {
+        char date_str[20];
+        strftime(date_str, sizeof(date_str), "%Y-%m-%d", &timeinfo);
+        lv_label_set_text(date_label, date_str);
+    } else {
+        if (WiFi.status() != WL_CONNECTED) {
+            lv_label_set_text(date_label, "No WiFi Connection");
+        } else {
+            lv_label_set_text(date_label, "Time Sync Failed");
+        }
+    }
+    lv_obj_set_style_text_font(date_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(date_label, lv_color_hex(0xfbbf24), 0);
+    lv_obj_align(date_label, LV_ALIGN_TOP_MID, 0, 10);
+    
+    // 星期显示
+    lv_obj_t* weekday_label = lv_label_create(calendar_container);
+    if (time_valid) {
+        const char* weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+        lv_label_set_text(weekday_label, weekdays[timeinfo.tm_wday]);
+    } else {
+        if (WiFi.status() != WL_CONNECTED) {
+            lv_label_set_text(weekday_label, "Connect WiFi in Settings");
+        } else {
+            lv_label_set_text(weekday_label, "Waiting for time sync...");
+        }
+    }
+    lv_obj_set_style_text_font(weekday_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(weekday_label, lv_color_hex(0xe5e7eb), 0);
+    lv_obj_align(weekday_label, LV_ALIGN_TOP_MID, 0, 35);
+    
+    // 月份标题
+    lv_obj_t* month_label = lv_label_create(calendar_container);
+    if (time_valid) {
+        char month_str[20];
+        strftime(month_str, sizeof(month_str), "%B %Y", &timeinfo);
+        lv_label_set_text(month_label, month_str);
+    } else {
+        if (WiFi.status() != WL_CONNECTED) {
+            lv_label_set_text(month_label, "No Network");
+        } else {
+            lv_label_set_text(month_label, "Syncing Time...");
+        }
+    }
+    lv_obj_set_style_text_font(month_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(month_label, lv_color_hex(0xf1f5f9), 0);
+    lv_obj_align(month_label, LV_ALIGN_TOP_MID, 0, 60);
+    
+    // 星期标题行
+    const char* weekdays[] = {"S", "M", "T", "W", "T", "F", "S"};
+    for (int i = 0; i < 7; i++) {
+        lv_obj_t* day_header = lv_label_create(calendar_container);
+        lv_label_set_text(day_header, weekdays[i]);
+        lv_obj_set_style_text_font(day_header, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(day_header, lv_color_hex(0x9ca3af), 0);
+        lv_obj_align(day_header, LV_ALIGN_TOP_LEFT, 25 + i * 35, 85);
+    }
+    
+    // 示例日期网格（简化版）
+    int current_day = time_valid ? timeinfo.tm_mday : 15;
+    for (int week = 0; week < 4; week++) {
+        for (int day = 0; day < 7; day++) {
+            int date_num = week * 7 + day + 1;
+            if (date_num <= 28) {
+                lv_obj_t* day_label = lv_label_create(calendar_container);
+                char day_text[4];
+                snprintf(day_text, sizeof(day_text), "%d", date_num);
+                lv_label_set_text(day_label, day_text);
+                lv_obj_set_style_text_font(day_label, &lv_font_montserrat_12, 0);
+                
+                // 高亮当前日期
+                if (date_num == current_day) {
+                    lv_obj_set_style_text_color(day_label, lv_color_hex(0xfbbf24), 0);
+                } else {
+                    lv_obj_set_style_text_color(day_label, lv_color_hex(0xe5e7eb), 0);
+                }
+                
+                lv_obj_align(day_label, LV_ALIGN_TOP_LEFT, 25 + day * 35, 105 + week * 25);
+            }
+        }
+    }
+    
+    // 提示信息
+    lv_obj_t* hint_label = lv_label_create(screen_calendar);
+    lv_label_set_text(hint_label, "Swipe right to return to main screen");
+    lv_obj_set_style_text_font(hint_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint_label, lv_color_hex(0x6b7280), 0);
+    lv_obj_align(hint_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+    
+    Serial.println("日历界面创建完成");
 }
 
 // ===== 核心逻辑 =====
@@ -2761,6 +3096,8 @@ void setup() {
     create_wifi_list_screen();     // 创建WiFi网络列表界面
     create_github_settings_screen(); // 创建GitHub配置界面
     create_chart_screen();         // 创建数据可视化图表界面
+    create_weather_screen();       // 创建天气界面
+    create_calendar_screen();      // 创建日历界面
     createUI(); // 创建主显示界面
 
     // 创建功能按钮（设置按钮、触摸测试按钮等）
@@ -3466,14 +3803,14 @@ void updateChartDisplay() {
 }
 
 /**
- * 星星卡片点击事件回调函数
- * 功能：处理星星卡片的点击事件，切换到图表界面
+ * 星星卡片长按事件回调函数
+ * 功能：处理星星卡片的长按事件，切换到图表界面
  */
 static void stars_card_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     
-    if (code == LV_EVENT_CLICKED) {
-        Serial.println("星星卡片被点击，切换到图表界面");
+    if (code == LV_EVENT_LONG_PRESSED) {
+        Serial.println("星星卡片被长按，切换到图表界面");
         
         // 创建图表界面（如果尚未创建）
         if (screen_chart == NULL) {
