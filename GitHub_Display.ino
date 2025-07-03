@@ -59,7 +59,9 @@
 #include <Arduino.h>              // Arduino核心库：提供基础的Arduino函数和定义
 #include <WiFi.h>                 // ESP32 WiFi库：WiFi连接、扫描、状态管理功能
 #include <HTTPClient.h>           // HTTP客户端库：用于向GitHub API发送HTTP请求
+#include <WiFiClientSecure.h>     // WiFi安全客户端库：用于HTTPS连接
 #include <ArduinoJson.h>          // JSON数据处理库：解析GitHub API返回的JSON格式数据
+// 移除gzip解压缩功能，直接处理未压缩响应
 #include <LovyanGFX.hpp>          // LovyanGFX图形库：高性能显示驱动，支持ILI9341等显示控制器
 #include <lvgl.h>                 // LVGL图形界面库：现代化UI组件库，提供按钮、标签、列表等控件
 #include <XPT2046_Touchscreen.h>  // XPT2046触摸屏库：处理电阻式触摸屏的触摸检测和坐标转换
@@ -67,6 +69,7 @@
 #include <Preferences.h>          // ESP32偏好设置库：在NVS(非易失性存储)中保存WiFi和GitHub配置
 #include <LittleFS.h>             // LittleFS文件系统库：用于持久化存储历史数据
 #include "secrets.h"
+#include "city_data.h"             // 城市数据头文件：包含拼音城市名称和adcode映射
 
 // ===== Font Awesome 图标字体文件 =====
 // 引用Font Awesome字体文件，用于显示各种图标（星星、眼睛、分支、齿轮等）
@@ -220,6 +223,7 @@ lv_obj_t *screen_github_settings;   // GitHub设置主界面
 lv_obj_t *screen_edit_owner;        // 编辑仓库所有者界面
 lv_obj_t *screen_edit_repo;         // 编辑仓库名称界面
 lv_obj_t *screen_edit_token;        // 编辑GitHub令牌界面
+lv_obj_t *screen_city_input;        // 城市输入界面
 
 // 数据可视化界面
 lv_obj_t *screen_chart;             // 数据可视化图表界面
@@ -241,6 +245,19 @@ lv_obj_t *kb;                   // 虚拟键盘：用于文本输入（WiFi密�
 lv_obj_t *settings_btn;         // 设置按钮：右上角齿轮图标，点击进入设置菜单
 lv_obj_t *touch_test_btn;       // 触摸测试按钮：左上角"T"图标，用于测试触摸坐标
 
+// ===== 天气界面显示元素引用 =====
+lv_obj_t *weather_location_label;  // 天气位置显示标签
+lv_obj_t *weather_temp_label;      // 天气温度显示标签
+lv_obj_t *weather_condition_label; // 天气状况显示标签
+lv_obj_t *weather_humidity_label;  // 湿度显示标签
+lv_obj_t *weather_wind_label;      // 风速显示标签
+
+// ===== 页面指示器相关变量 =====
+lv_obj_t *page_indicator_main;     // 主页面指示器容器
+lv_obj_t *page_indicator_weather;  // 天气页面指示器容器
+lv_obj_t *page_indicator_calendar; // 日历页面指示器容器
+lv_obj_t *indicator_dots[3];       // 指示器小圆点数组（0=天气，1=主页，2=日历）
+
 // ===== 临时数据存储 =====
 static char selected_ssid[33];  // 当前选中的WiFi网络名称：用于WiFi连接流程
 
@@ -258,6 +275,22 @@ const char* GROWTH_DATA_FILE = "/growth_data.csv"; // 增长数据文件路径
 int lastSavedStars = -1;                // 上次保存的星标数，用于检测增长
 time_t lastDailySaveTime = 0;           // 上次每日保存的时间戳
 
+// ===== 天气数据相关变量 =====
+float currentTemperature = 0.0;         // 当前温度（摄氏度）
+int currentHumidity = 0;                // 当前湿度（百分比）
+float currentWindSpeed = 0.0;           // 当前风速（km/h）
+String currentWeatherCondition = "Unknown"; // 当前天气状况
+String currentLocation = "Unknown";     // 当前位置
+unsigned long lastWeatherUpdate = 0;    // 上次天气更新时间戳（毫秒）
+bool isWeatherDataValid = false;        // 天气数据是否有效
+const unsigned long WEATHER_UPDATE_INTERVAL = 600000; // 天气更新间隔：10分钟
+
+// 高德天气API配置
+const char* WEATHER_API_HOST = "restapi.amap.com";
+const char* WEATHER_API_KEY = SECRET_WEATHER_API_KEY;  // 高德地图API密钥（从secrets.h引用）
+const char* DEFAULT_LOCATION = "110101";  // 默认位置ID（北京东城区）
+String userLocation = DEFAULT_LOCATION;  // 用户设置的位置ID
+
 // ===== 函数前置声明 =====
 // UI创建函数
 void createUI();                                              // 创建主界面UI
@@ -268,9 +301,21 @@ void create_github_settings_screen();                         // 创建GitHub设
 void create_edit_owner_screen();                              // 创建编辑仓库所有者界面
 void create_edit_repo_screen();                               // 创建编辑仓库名称界面
 void create_edit_token_screen();                              // 创建编辑GitHub令牌界面
+void create_city_input_screen();                              // 创建城市输入界面
 void create_chart_screen();                                   // 创建数据可视化图表界面
 void create_weather_screen();                                 // 创建天气信息界面
 void create_calendar_screen();                                // 创建日历界面
+
+// 天气数据管理函数
+void fetchWeatherData();                                      // 获取天气数据
+void updateWeatherDisplay();                                  // 更新天气显示
+void loadWeatherSettings();                                   // 加载天气设置
+void saveWeatherSettings();                                   // 保存天气设置
+// getWeatherDescription函数已删除，高德天气API直接提供天气描述
+
+// 页面指示器管理函数
+void createPageIndicator(lv_obj_t* parent);                  // 创建页面指示器
+void updatePageIndicator(int current_page);                  // 更新页面指示器状态（0=天气，1=主页，2=日历）
 
 // 数据管理函数
 void load_settings();                                         // 从NVS加载配置设置
@@ -297,6 +342,7 @@ static void number_anim_cb(void* var, int32_t val);          // 数字动画回�
 // 事件回调函数
 static void hide_keyboard_event_cb(lv_event_t * e);          // 隐藏虚拟键盘事件回调
 static void show_keyboard_event_cb(lv_event_t * e);          // 显示虚拟键盘事件回调
+void city_input_ta_event_cb(lv_event_t * e);                 // 城市输入文本框事件回调
 static void edit_field_event_cb(lv_event_t * e);             // 编辑字段事件回调
 static void save_field_event_cb(lv_event_t * e);             // 保存字段事件回调
 static void stars_card_event_cb(lv_event_t * e);             // 星星卡片点击事件回调
@@ -649,7 +695,65 @@ static void settings_list_event_cb(lv_event_t * e) {
             lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_FADE_ON, 100, 0, false);  // 使用淡入动画返回主屏幕
             control_buttons_visibility(main_screen);  // 更新按钮显示状态
         }
-     }
+    }
+}
+
+/**
+ * 创建页面指示器函数
+ * 功能：在指定的父容器中创建三个小圆点作为页面指示器
+ * 参数：parent - 父容器对象
+ */
+void createPageIndicator(lv_obj_t* parent) {
+    // 创建指示器容器
+    lv_obj_t* indicator_container = lv_obj_create(parent);
+    lv_obj_set_size(indicator_container, 80, 20);
+    lv_obj_align(indicator_container, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_set_style_bg_opa(indicator_container, LV_OPA_TRANSP, 0);  // 透明背景
+    lv_obj_set_style_border_width(indicator_container, 0, 0);  // 无边框
+    lv_obj_clear_flag(indicator_container, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // 创建三个小圆点
+    for (int i = 0; i < 3; i++) {
+        indicator_dots[i] = lv_obj_create(indicator_container);
+        lv_obj_set_size(indicator_dots[i], 8, 8);
+        lv_obj_set_style_radius(indicator_dots[i], LV_RADIUS_CIRCLE, 0);  // 圆形
+        lv_obj_set_style_border_width(indicator_dots[i], 0, 0);  // 无边框
+        lv_obj_clear_flag(indicator_dots[i], LV_OBJ_FLAG_SCROLLABLE);
+        
+        // 设置位置：左中右排列
+        lv_obj_align(indicator_dots[i], LV_ALIGN_CENTER, (i - 1) * 20, 0);
+        
+        // 设置默认颜色（非活跃状态）
+        lv_obj_set_style_bg_color(indicator_dots[i], lv_color_hex(0x4b5563), 0);
+    }
+    
+    // 保存指示器容器引用
+    if (parent == main_screen) {
+        page_indicator_main = indicator_container;
+    } else if (parent == screen_weather) {
+        page_indicator_weather = indicator_container;
+    } else if (parent == screen_calendar) {
+        page_indicator_calendar = indicator_container;
+    }
+}
+
+/**
+ * 更新页面指示器状态函数
+ * 功能：根据当前页面更新指示器小圆点的颜色
+ * 参数：current_page - 当前页面索引（0=天气，1=主页，2=日历）
+ */
+void updatePageIndicator(int current_page) {
+    for (int i = 0; i < 3; i++) {
+        if (indicator_dots[i] != NULL) {
+            if (i == current_page) {
+                // 当前页面：亮色显示
+                lv_obj_set_style_bg_color(indicator_dots[i], lv_color_hex(0xfbbf24), 0);
+            } else {
+                // 非当前页面：暗色显示
+                lv_obj_set_style_bg_color(indicator_dots[i], lv_color_hex(0x4b5563), 0);
+            }
+        }
+    }
 }
 
 /**
@@ -906,6 +1010,356 @@ static void ta_event_cb(lv_event_t * e) {
     }
 }
 
+// ===== 天气数据管理函数实现 =====
+
+/**
+ * 获取天气数据函数
+ * 功能：通过高德天气API获取当前位置的天气信息
+ * 特点：使用高德天气API，需要API密钥，支持中国境内天气数据
+ */
+void fetchWeatherData() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi未连接，无法获取天气数据");
+        Serial.printf("WiFi状态: %d\n", WiFi.status());
+        return;
+    }
+    
+    Serial.printf("WiFi连接状态: 已连接到 %s\n", WiFi.SSID().c_str());
+    Serial.printf("本地IP地址: %s\n", WiFi.localIP().toString().c_str());
+    
+    // 检查是否需要更新天气数据
+    unsigned long currentTime = millis();
+    unsigned long timeSinceLastUpdate = currentTime - lastWeatherUpdate;
+    
+    Serial.printf("[DEBUG] 天气数据检查: 当前时间=%lu, 上次更新=%lu, 时间差=%lu, 更新间隔=%lu\n", 
+                  currentTime, lastWeatherUpdate, timeSinceLastUpdate, WEATHER_UPDATE_INTERVAL);
+    Serial.printf("[DEBUG] 天气数据有效性: %s\n", isWeatherDataValid ? "有效" : "无效");
+    
+    if (isWeatherDataValid && (timeSinceLastUpdate < WEATHER_UPDATE_INTERVAL)) {
+        Serial.printf("天气数据仍然有效，跳过更新 (剩余时间: %lu毫秒)\n", WEATHER_UPDATE_INTERVAL - timeSinceLastUpdate);
+        Serial.printf("[DEBUG] 当前天气数据: 温度=%.1f°C, 湿度=%d%%, 风速=%.1fkm/h, 天气=%s\n", 
+                      currentTemperature, currentHumidity, currentWindSpeed, currentWeatherCondition.c_str());
+        return;
+    }
+    
+    Serial.println("开始获取天气数据...");
+    Serial.println("当前位置ID: " + userLocation);
+    
+    WiFiClientSecure client;
+    HTTPClient http;
+    
+    // 配置HTTPS客户端
+    client.setInsecure(); // 跳过证书验证（生产环境建议使用证书）
+    
+    // 构建高德天气API请求URL
+    String url = "https://" + String(WEATHER_API_HOST) + "/v3/weather/weatherInfo?city=" + userLocation + "&key=" + String(WEATHER_API_KEY);
+    
+    Serial.println("请求URL: " + url);
+    Serial.println("开始发送HTTPS请求...");
+    
+    http.begin(client, url);
+    http.setTimeout(15000); // 15秒超时
+    http.addHeader("User-Agent", "ESP32-WeatherDisplay/1.0");
+    http.addHeader("Accept", "application/json");
+    http.addHeader("Accept-Encoding", "identity"); // 要求未压缩响应，避免解压缩复杂性
+    http.addHeader("Connection", "close");
+    
+    int httpResponseCode = http.GET();
+    
+    if (httpResponseCode == 200) {
+        // 直接获取未压缩的响应数据
+        String payload = http.getString();
+        Serial.println("接收到天气API响应");
+        
+        Serial.println("天气API响应: " + payload);
+        
+        // 解析高德天气API JSON响应
+        DynamicJsonDocument doc(2048);
+        DeserializationError error = deserializeJson(doc, payload);
+        
+        if (error) {
+            Serial.println("JSON解析失败: " + String(error.c_str()));
+            http.end();
+            return;
+        }
+        
+        // 检查API响应状态
+        String status = doc["status"].as<String>();
+        if (status != "1") {
+            String info = doc["info"].as<String>();
+            Serial.println("高德天气API错误，状态: " + status + ", 信息: " + info);
+            http.end();
+            return;
+        }
+        
+        // 提取高德天气数据
+        if (doc["lives"].is<JsonArray>() && doc["lives"].size() > 0) {
+            JsonObject weather = doc["lives"][0];
+            
+            // 提取温度（摄氏度）
+            currentTemperature = weather["temperature"].as<float>();
+            
+            // 提取湿度（百分比）
+            currentHumidity = weather["humidity"].as<int>();
+            
+            // 提取风力等级（转换为大概的风速）
+            String windpower = weather["windpower"].as<String>();
+            // 简单转换：≤3级约为10km/h，4-5级约为20km/h，6-7级约为35km/h
+            if (windpower.indexOf("≤3") >= 0) {
+                currentWindSpeed = 10.0;
+            } else if (windpower.indexOf("4") >= 0 || windpower.indexOf("5") >= 0) {
+                currentWindSpeed = 20.0;
+            } else if (windpower.indexOf("6") >= 0 || windpower.indexOf("7") >= 0) {
+                currentWindSpeed = 35.0;
+            } else {
+                currentWindSpeed = 15.0; // 默认值
+            }
+            
+            // 提取天气描述
+            currentWeatherCondition = weather["weather"].as<String>();
+            
+            // 更新时间戳和状态
+            lastWeatherUpdate = currentTime;
+            isWeatherDataValid = true;
+            
+            Serial.printf("[DEBUG] 天气数据更新成功:\n");
+            Serial.printf("[DEBUG] - 温度: %.1f°C\n", currentTemperature);
+            Serial.printf("[DEBUG] - 湿度: %d%%\n", currentHumidity);
+            Serial.printf("[DEBUG] - 风速: %.1fkm/h\n", currentWindSpeed);
+            Serial.printf("[DEBUG] - 天气状况: %s\n", currentWeatherCondition.c_str());
+            Serial.printf("[DEBUG] - 位置ID: %s\n", userLocation.c_str());
+            Serial.printf("[DEBUG] - 更新时间戳: %lu\n", lastWeatherUpdate);
+            
+            // 更新天气显示
+            Serial.println("[DEBUG] 开始更新天气显示界面...");
+            updateWeatherDisplay();
+            Serial.println("[DEBUG] 天气显示界面更新完成");
+        } else {
+            Serial.println("高德天气数据格式错误");
+        }
+    } else {
+        Serial.printf("天气API请求失败，HTTP代码: %d\n", httpResponseCode);
+        if (httpResponseCode > 0) {
+            String errorResponse = http.getString();
+            Serial.println("错误响应: " + errorResponse);
+        } else {
+            Serial.println("网络连接错误或超时");
+        }
+        
+        // 标记天气数据为无效
+        isWeatherDataValid = false;
+        Serial.println("天气数据已标记为无效");
+    }
+    
+    http.end();
+}
+
+/**
+ * 从JSON文件获取城市名称函数
+ * 功能：根据输入的位置ID，从city_adcodes.json文件中查找对应的城市名称
+ * 参数：locationId - 位置ID（adcode）
+ * 返回：对应的城市名称，如果未找到则返回"Location + ID"
+ */
+String getLocationName(const String& locationId) {
+    // 使用头文件中的查找函数
+    const CityData* cityData = findCityByAdcode(locationId.c_str());
+    if (cityData != nullptr) {
+        Serial.printf("找到位置ID %s 对应的城市: %s\n", locationId.c_str(), cityData->english);
+        return String(cityData->english);
+    }
+    
+    // 如果没有找到匹配的城市，返回默认格式
+    Serial.printf("未找到位置ID %s 对应的城市\n", locationId.c_str());
+    return "Location " + locationId;
+}
+
+/**
+ * 将中文天气状况转换为英文
+ * 功能：将高德天气API返回的中文天气描述转换为对应的英文描述
+ * 参数：chineseWeather - 中文天气描述
+ * 返回：对应的英文天气描述
+ */
+String translateWeatherToEnglish(const String& chineseWeather) {
+    if (chineseWeather == "晴") return "Sunny";
+    if (chineseWeather == "多云") return "Cloudy";
+    if (chineseWeather == "阴") return "Overcast";
+    if (chineseWeather == "阵雨") return "Showers";
+    if (chineseWeather == "雷阵雨") return "Thunderstorms";
+    if (chineseWeather == "雷阵雨伴有冰雹") return "Thunderstorms with Hail";
+    if (chineseWeather == "雨夹雪") return "Sleet";
+    if (chineseWeather == "小雨") return "Light Rain";
+    if (chineseWeather == "中雨") return "Moderate Rain";
+    if (chineseWeather == "大雨") return "Heavy Rain";
+    if (chineseWeather == "暴雨") return "Rainstorm";
+    if (chineseWeather == "大暴雨") return "Heavy Rainstorm";
+    if (chineseWeather == "特大暴雨") return "Severe Rainstorm";
+    if (chineseWeather == "阵雪") return "Snow Showers";
+    if (chineseWeather == "小雪") return "Light Snow";
+    if (chineseWeather == "中雪") return "Moderate Snow";
+    if (chineseWeather == "大雪") return "Heavy Snow";
+    if (chineseWeather == "暴雪") return "Blizzard";
+    if (chineseWeather == "雾") return "Fog";
+    if (chineseWeather == "冻雨") return "Freezing Rain";
+    if (chineseWeather == "沙尘暴") return "Sandstorm";
+    if (chineseWeather == "小雨-中雨") return "Light to Moderate Rain";
+    if (chineseWeather == "中雨-大雨") return "Moderate to Heavy Rain";
+    if (chineseWeather == "大雨-暴雨") return "Heavy Rain to Rainstorm";
+    if (chineseWeather == "暴雨-大暴雨") return "Rainstorm to Heavy Rainstorm";
+    if (chineseWeather == "大暴雨-特大暴雨") return "Heavy to Severe Rainstorm";
+    if (chineseWeather == "小雪-中雪") return "Light to Moderate Snow";
+    if (chineseWeather == "中雪-大雪") return "Moderate to Heavy Snow";
+    if (chineseWeather == "大雪-暴雪") return "Heavy Snow to Blizzard";
+    if (chineseWeather == "浮尘") return "Dust";
+    if (chineseWeather == "扬沙") return "Sand";
+    if (chineseWeather == "强沙尘暴") return "Strong Sandstorm";
+    if (chineseWeather == "霾") return "Haze";
+    
+    // 如果没有匹配的翻译，返回原文
+    return chineseWeather;
+}
+
+/**
+ * 根据城市名称获取位置ID
+ * 功能：将用户输入的城市名称转换为高德地图API所需的位置ID
+ * 参数：cityName - 城市名称
+ * 返回：对应的位置ID，如果未找到则返回默认位置
+ */
+/**
+ * 拼音到中文城市名称映射函数
+ * 功能：将拼音输入转换为对应的中文城市名称
+ * 参数：pinyin - 拼音输入
+ * 返回：对应的中文城市名称，如果未找到则返回原输入
+ */
+/**
+ * 根据拼音查找城市adcode函数（支持模糊搜索和缩写）
+ * 功能：使用city_data.h中的模糊搜索功能查找城市信息
+ * 参数：pinyin - 拼音城市名称或缩写
+ * 返回：找到的城市adcode，未找到返回空字符串
+ */
+String getCityAdcodeByPinyin(const String& pinyin) {
+    String lowerPinyin = pinyin;
+    lowerPinyin.toLowerCase();
+    
+    // 使用头文件中的模糊搜索函数
+    const CityData* cityData = findCityByFuzzySearch(lowerPinyin.c_str());
+    if (cityData != nullptr) {
+        Serial.printf("模糊搜索找到城市: %s -> %s (adcode: %s)\n", 
+                     lowerPinyin.c_str(), cityData->english, cityData->adcode);
+        return String(cityData->adcode);
+    }
+    
+    Serial.printf("未找到城市: %s\n", lowerPinyin.c_str());
+    return "";
+}
+
+/**
+ * 获取城市位置ID函数
+ * 功能：根据输入的城市名称，从city_data.h中查找对应的adcode
+ * 参数：cityName - 城市名称（支持拼音输入）
+ * 返回：对应的城市adcode，如果未找到则返回默认位置
+ */
+String getCityLocationId(const String& cityName) {
+    String searchName = cityName;
+    searchName.trim(); // 去除首尾空格
+    searchName.toLowerCase(); // 转换为小写
+    
+    Serial.printf("查找城市: %s\n", searchName.c_str());
+    
+    // 首先尝试拼音查找
+    String adcode = getCityAdcodeByPinyin(searchName);
+    if (adcode != "") {
+        return adcode;
+    }
+    
+    // 如果拼音查找失败，返回默认位置
+    Serial.printf("未找到城市 %s，使用默认位置\n", searchName.c_str());
+    return DEFAULT_LOCATION;
+}
+
+/**
+ * 更新天气显示函数
+ * 功能：更新天气界面上的位置、温度、湿度、风速和天气状况显示
+ */
+void updateWeatherDisplay() {
+    Serial.printf("[DEBUG] updateWeatherDisplay: screen_weather=%p, isWeatherDataValid=%s\n", 
+                  screen_weather, isWeatherDataValid ? "true" : "false");
+    
+    if (screen_weather == NULL || !isWeatherDataValid) {
+        Serial.println("[DEBUG] updateWeatherDisplay: 跳过更新 - 界面未创建或数据无效");
+        return;
+    }
+    
+    Serial.println("[DEBUG] updateWeatherDisplay: 开始更新各个显示元素...");
+    
+    // 更新天气显示元素的内容
+    if (weather_location_label != NULL) {
+        String locationName = getLocationName(userLocation);
+        lv_label_set_text(weather_location_label, locationName.c_str());
+        Serial.printf("[DEBUG] - 位置标签已更新: %s\n", locationName.c_str());
+    } else {
+        Serial.println("[DEBUG] - 位置标签为NULL，跳过更新");
+    }
+    
+    if (weather_temp_label != NULL) {
+        lv_label_set_text_fmt(weather_temp_label, "%.1f°C", currentTemperature);
+        Serial.printf("[DEBUG] - 温度标签已更新: %.1f°C\n", currentTemperature);
+    } else {
+        Serial.println("[DEBUG] - 温度标签为NULL，跳过更新");
+    }
+    
+    if (weather_condition_label != NULL) {
+        String englishWeather = translateWeatherToEnglish(currentWeatherCondition);
+        lv_label_set_text(weather_condition_label, englishWeather.c_str());
+        Serial.printf("[DEBUG] - 天气状况标签已更新: %s -> %s\n", currentWeatherCondition.c_str(), englishWeather.c_str());
+    } else {
+        Serial.println("[DEBUG] - 天气状况标签为NULL，跳过更新");
+    }
+    
+    if (weather_humidity_label != NULL) {
+        lv_label_set_text_fmt(weather_humidity_label, "Humidity: %d%%", currentHumidity);
+        Serial.printf("[DEBUG] - 湿度标签已更新: %d%%\n", currentHumidity);
+    } else {
+        Serial.println("[DEBUG] - 湿度标签为NULL，跳过更新");
+    }
+    
+    if (weather_wind_label != NULL) {
+        lv_label_set_text_fmt(weather_wind_label, "Wind: %.1f km/h", currentWindSpeed);
+        Serial.printf("[DEBUG] - 风速标签已更新: %.1fkm/h\n", currentWindSpeed);
+    } else {
+        Serial.println("[DEBUG] - 风速标签为NULL，跳过更新");
+    }
+    
+    Serial.println("[DEBUG] updateWeatherDisplay: 所有天气显示元素更新完成");
+}
+
+/**
+ * 加载天气设置函数
+ * 功能：从NVS存储中加载用户设置的位置ID
+ */
+void loadWeatherSettings() {
+    preferences.begin("weather", true); // 只读模式
+    
+    userLocation = preferences.getString("location", DEFAULT_LOCATION);
+    
+    preferences.end();
+    
+    Serial.println("天气设置已加载: 位置ID=" + userLocation);
+}
+
+/**
+ * 保存天气设置函数
+ * 功能：将用户设置的位置ID保存到NVS存储
+ */
+void saveWeatherSettings() {
+    preferences.begin("weather", false); // 读写模式
+    
+    preferences.putString("location", userLocation);
+    
+    preferences.end();
+    
+    Serial.println("天气设置已保存: 位置ID=" + userLocation);
+}
+
 /**
  * 隐藏键盘事件处理函数
  * 功能：隐藏虚拟键盘
@@ -928,6 +1382,208 @@ static void show_keyboard_event_cb(lv_event_t * e) {
         lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);  // 显示键盘
         Serial.println("键盘已显示");
     }
+}
+
+/**
+ * 保存城市事件处理函数
+ * 功能：保存用户输入的城市名称，转换为位置ID并更新天气数据
+ * 参数：e - LVGL事件对象
+ */
+/**
+ * 城市保存按钮事件回调函数
+ * 功能：保存用户输入的城市名称，转换为位置ID，保存设置并立即刷新天气数据
+ * 参数：e - LVGL事件对象
+ */
+static void save_city_event_cb(lv_event_t * e) {
+    lv_obj_t * btn = (lv_obj_t*)lv_event_get_target(e);  // 获取被点击的保存按钮
+    lv_obj_t * ta = (lv_obj_t*)lv_event_get_user_data(e);  // 获取关联的文本框对象
+    
+    const char* cityName = lv_textarea_get_text(ta);  // 获取文本框中的城市名称
+    Serial.printf("保存城市名称: %s\n", cityName);
+    
+    // 将城市名称转换为位置ID
+    String newLocationId = getCityLocationId(cityName);
+    Serial.printf("转换后的位置ID: %s\n", newLocationId.c_str());
+    
+    // 更新位置ID并保存设置（实现数据持久化）
+    userLocation = newLocationId;
+    saveWeatherSettings();
+    
+    // 立即刷新天气数据（重置更新时间戳以强制立即更新）
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("[DEBUG] 城市保存成功，准备立即刷新天气数据");
+        Serial.printf("[DEBUG] 重置前 - lastWeatherUpdate: %lu, isWeatherDataValid: %s\n", 
+                      lastWeatherUpdate, isWeatherDataValid ? "true" : "false");
+        
+        lastWeatherUpdate = 0;  // 重置天气更新时间戳，强制立即更新
+        isWeatherDataValid = false;  // 标记当前数据为无效，确保强制更新
+        
+        Serial.printf("[DEBUG] 重置后 - lastWeatherUpdate: %lu, isWeatherDataValid: %s\n", 
+                      lastWeatherUpdate, isWeatherDataValid ? "true" : "false");
+        Serial.println("[DEBUG] 开始调用fetchWeatherData()...");
+        
+        fetchWeatherData();     // 立即获取新城市的天气数据
+        
+        Serial.println("[DEBUG] fetchWeatherData()调用完成");
+    } else {
+        Serial.printf("[DEBUG] WiFi未连接(状态: %d)，无法立即刷新天气数据\n", WiFi.status());
+    }
+    
+    // 返回天气界面
+    if (screen_weather != NULL) {
+        Serial.println("[DEBUG] 切换回天气界面");
+        lv_scr_load_anim(screen_weather, LV_SCR_LOAD_ANIM_MOVE_TOP, 200, 0, false);
+        
+        // 如果天气数据有效，立即更新显示
+        Serial.printf("[DEBUG] 检查是否需要更新显示 - isWeatherDataValid: %s\n", 
+                      isWeatherDataValid ? "true" : "false");
+        if (isWeatherDataValid) {
+            Serial.println("[DEBUG] 天气数据有效，立即更新显示");
+            updateWeatherDisplay();
+        } else {
+            Serial.println("[DEBUG] 天气数据无效，跳过显示更新");
+        }
+    } else {
+        Serial.println("[DEBUG] 天气界面为NULL，无法切换");
+    }
+}
+
+// 全局变量声明，用于存储键盘对象
+lv_obj_t* city_input_keyboard = NULL;
+
+/**
+ * 文本框事件回调函数
+ * 功能：处理文本框的点击和失焦事件，控制键盘的显示和隐藏
+ */
+void city_input_ta_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t * ta = (lv_obj_t*)lv_event_get_target(e);
+    
+    if(code == LV_EVENT_FOCUSED || code == LV_EVENT_CLICKED) {
+        // 文本框被点击或获得焦点
+        Serial.println("城市输入框被点击/聚焦，显示键盘");
+        if(city_input_keyboard != NULL) {
+            lv_keyboard_set_textarea(city_input_keyboard, ta);  // 将键盘与当前文本框关联
+            lv_obj_clear_flag(city_input_keyboard, LV_OBJ_FLAG_HIDDEN);  // 显示键盘
+            lv_obj_move_foreground(city_input_keyboard);  // 将键盘移到前景
+        }
+    }
+    else if(code == LV_EVENT_DEFOCUSED) {
+        // 文本框失去焦点
+        Serial.println("城市输入框失去焦点，隐藏键盘");
+        if(city_input_keyboard != NULL) {
+            lv_obj_add_flag(city_input_keyboard, LV_OBJ_FLAG_HIDDEN);  // 自动隐藏键盘
+        }
+    }
+}
+
+/**
+ * 创建城市输入界面
+ * 功能：创建用于输入城市名称的界面，键盘按需显示
+ */
+void create_city_input_screen() {
+    if(screen_city_input) lv_obj_del(screen_city_input);  // 如果界面已存在则先删除
+    screen_city_input = lv_obj_create(NULL);  // 创建城市输入屏幕对象
+
+    // 现代化背景设计
+    lv_obj_set_style_bg_color(screen_city_input, lv_color_hex(0x1e293b), 0);  // 深蓝灰背景
+    lv_obj_set_style_bg_grad_color(screen_city_input, lv_color_hex(0x0f172a), 0);  // 渐变
+    lv_obj_set_style_bg_grad_dir(screen_city_input, LV_GRAD_DIR_VER, 0);
+
+    // 创建现代化标题
+    lv_obj_t* title = lv_label_create(screen_city_input);  // 创建标题标签
+    lv_label_set_text(title, LV_SYMBOL_HOME " City Weather Settings");  // 使用LVGL内置家符号
+    lv_obj_set_style_text_color(title, lv_color_hex(0xf1f5f9), 0);  // 浅色文字
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);  // 设置标题字体
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);  // 顶部居中对齐，向下偏移30像素
+
+    // 创建现代化输入框
+    lv_obj_t* ta = lv_textarea_create(screen_city_input);  // 创建文本输入区域
+    lv_obj_set_size(ta, 280, 40);  // 设置输入框尺寸
+    lv_obj_align(ta, LV_ALIGN_TOP_MID, 0, 80);  // 向下偏移80像素
+    lv_obj_set_style_bg_color(ta, lv_color_hex(0x334155), 0);  // 输入框背景色
+    lv_obj_set_style_bg_opa(ta, LV_OPA_70, 0);  // 半透明背景
+    lv_obj_set_style_border_color(ta, lv_color_hex(0x64748b), 0);  // 边框颜色
+    lv_obj_set_style_border_width(ta, 1, 0);  // 细边框
+    lv_obj_set_style_radius(ta, 8, 0);  // 圆角
+    lv_obj_set_style_shadow_width(ta, 10, 0);  // 阴影宽度
+    lv_obj_set_style_shadow_opa(ta, LV_OPA_30, 0);  // 阴影透明度
+    
+    // 设置提示文本
+    lv_textarea_set_placeholder_text(ta, "Enter city name (Chinese/Pinyin)");
+    lv_obj_set_style_text_color(ta, lv_color_hex(0xf1f5f9), 0);  // 文本颜色
+    lv_obj_set_style_text_font(ta, &lv_font_montserrat_14, 0);  // 文本字体
+    lv_textarea_set_one_line(ta, true);  // 设置为单行输入
+    
+    // 添加文本框事件回调
+    lv_obj_add_event_cb(ta, city_input_ta_event_cb, LV_EVENT_ALL, NULL);
+    
+    // 创建按钮容器（水平排列）
+    lv_obj_t* btn_container = lv_obj_create(screen_city_input);
+    lv_obj_set_size(btn_container, 260, 50);  // 设置容器尺寸
+    lv_obj_align(btn_container, LV_ALIGN_TOP_MID, 0, 140);  // 向下偏移140像素
+    lv_obj_set_style_bg_opa(btn_container, LV_OPA_TRANSP, 0);  // 透明背景
+    lv_obj_set_style_border_width(btn_container, 0, 0);  // 无边框
+    lv_obj_clear_flag(btn_container, LV_OBJ_FLAG_SCROLLABLE);  // 禁用滚动
+    lv_obj_set_flex_flow(btn_container, LV_FLEX_FLOW_ROW);  // 设置为水平布局
+    lv_obj_set_flex_align(btn_container, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);  // 均匀分布
+
+    // 创建保存按钮
+    lv_obj_t* save_btn = lv_btn_create(btn_container);  // 在容器中创建保存按钮
+    lv_obj_set_size(save_btn, 120, 40);  // 设置按钮尺寸
+    lv_obj_set_style_bg_color(save_btn, lv_color_hex(0x0ea5e9), 0);  // 蓝色按钮
+    lv_obj_set_style_bg_grad_color(save_btn, lv_color_hex(0x0284c7), 0);  // 渐变
+    lv_obj_set_style_bg_grad_dir(save_btn, LV_GRAD_DIR_VER, 0);  // 垂直渐变
+    lv_obj_set_style_radius(save_btn, 8, 0);  // 圆角
+    lv_obj_set_style_shadow_width(save_btn, 10, 0);  // 阴影宽度
+    lv_obj_set_style_shadow_opa(save_btn, LV_OPA_30, 0);  // 阴影透明度
+    
+    // 保存按钮标签
+    lv_obj_t* save_label = lv_label_create(save_btn);  // 创建按钮标签
+    lv_label_set_text(save_label, LV_SYMBOL_SAVE " Save");  // 使用LVGL内置保存符号
+    lv_obj_center(save_label);  // 居中对齐
+    
+    // 添加保存按钮事件回调
+    lv_obj_add_event_cb(save_btn, save_city_event_cb, LV_EVENT_CLICKED, ta);
+
+    // 创建取消按钮
+    lv_obj_t* cancel_btn = lv_btn_create(btn_container);  // 在容器中创建取消按钮
+    lv_obj_set_size(cancel_btn, 120, 40);  // 设置按钮尺寸
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x64748b), 0);  // 灰色按钮
+    lv_obj_set_style_radius(cancel_btn, 8, 0);  // 圆角
+    
+    // 取消按钮标签
+    lv_obj_t* cancel_label = lv_label_create(cancel_btn);  // 创建按钮标签
+    lv_label_set_text(cancel_label, LV_SYMBOL_CLOSE " Cancel");  // 使用LVGL内置关闭符号
+    lv_obj_center(cancel_label);  // 居中对齐
+    
+    // 添加取消按钮事件回调
+    lv_obj_add_event_cb(cancel_btn, [](lv_event_t * e) {
+        // 隐藏键盘
+        if(city_input_keyboard) {
+            lv_obj_add_flag(city_input_keyboard, LV_OBJ_FLAG_HIDDEN);
+        }
+        // 返回天气界面
+        if (screen_weather != NULL) {
+            lv_scr_load_anim(screen_weather, LV_SCR_LOAD_ANIM_MOVE_TOP, 200, 0, false);
+        }
+    }, LV_EVENT_CLICKED, NULL);
+    
+    // 添加提示标签
+    lv_obj_t* hint_label = lv_label_create(screen_city_input);  // 创建提示标签
+    lv_label_set_text(hint_label, "Supports all cities in China\n\nSmart search with abbreviations:\nbj->beijing, sh->shanghai, gz->guangzhou\nnc->nanchang, cd->chengdu, wh->wuhan\n\nFull pinyin also supported:\nbeijing, shanghai, nanjing, hangzhou");
+    lv_obj_set_style_text_color(hint_label, lv_color_hex(0x94a3b8), 0);  // 浅灰色文字
+    lv_obj_set_style_text_font(hint_label, &lv_font_montserrat_10, 0);  // 小字体
+    lv_obj_set_style_text_align(hint_label, LV_TEXT_ALIGN_CENTER, 0);  // 文本居中对齐
+    lv_obj_align(hint_label, LV_ALIGN_TOP_MID, 0, 200);  // 向下偏移200像素
+    
+    // 创建虚拟键盘（默认隐藏）
+    city_input_keyboard = lv_keyboard_create(screen_city_input);  // 创建虚拟键盘对象
+    lv_keyboard_set_textarea(city_input_keyboard, ta);  // 将键盘与文本输入框关联
+    lv_obj_align(city_input_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);  // 底部居中对齐
+    lv_obj_add_flag(city_input_keyboard, LV_OBJ_FLAG_HIDDEN);  // 默认隐藏键盘
+    
+    Serial.println("城市输入界面创建完成");
 }
 
 /**
@@ -1834,6 +2490,8 @@ static void main_screen_gesture_event_cb(lv_event_t * e) {
             create_calendar_screen();
             lv_scr_load_anim(screen_calendar, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
             control_buttons_visibility(screen_calendar);
+            // 更新页面指示器状态
+            updatePageIndicator(2);
         }
         else if (dir == LV_DIR_RIGHT) {
             // 右滑显示天气界面
@@ -1843,6 +2501,8 @@ static void main_screen_gesture_event_cb(lv_event_t * e) {
             }
             lv_scr_load_anim(screen_weather, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
             control_buttons_visibility(screen_weather);
+            // 更新页面指示器状态
+            updatePageIndicator(0);
         }
     }
 }
@@ -1976,6 +2636,12 @@ void createUI() {
     lv_obj_set_style_bg_color(progress_bar, lv_color_hex(0x374151), 0);
     lv_obj_set_style_bg_color(progress_bar, lv_color_hex(0x10b981), LV_PART_INDICATOR);
     lv_obj_add_flag(progress_bar, LV_OBJ_FLAG_HIDDEN);
+    
+    // 创建页面指示器
+    createPageIndicator(main_screen);
+    
+    // 设置主页为当前页面（索引1）
+    updatePageIndicator(1);
 
     Serial.println("UI创建完成。");
 }
@@ -2003,6 +2669,8 @@ void create_weather_screen() {
                 if (main_screen != NULL) {
                     lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
                     control_buttons_visibility(main_screen);
+                    // 更新页面指示器状态
+                    updatePageIndicator(1);
                 } else {
                     Serial.println("错误：main_screen为NULL");
                 }
@@ -2027,89 +2695,132 @@ void create_weather_screen() {
         }
     }
     
-    // 创建日期显示（在屏幕顶部）
-    lv_obj_t* date_label = lv_label_create(screen_weather);
+    // 创建天气标题（移到最上面，删除图标）
+    lv_obj_t* title_label = lv_label_create(screen_weather);
+    lv_label_set_text(title_label, "Weather");
+    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(title_label, lv_color_hex(0xf1f5f9), 0);
+    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 10);
+    
+    // 创建日期显示（在标题下方）
     if (time_valid) {
+        lv_obj_t* date_label = lv_label_create(screen_weather);
         char date_str[20];
         strftime(date_str, sizeof(date_str), "%Y-%m-%d", &timeinfo);
         lv_label_set_text(date_label, date_str);
-    } else {
-        if (WiFi.status() != WL_CONNECTED) {
-            lv_label_set_text(date_label, "No WiFi Connection");
-        } else {
-            lv_label_set_text(date_label, "Time Sync Failed");
-        }
+        lv_obj_set_style_text_font(date_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(date_label, lv_color_hex(0xfbbf24), 0);
+        lv_obj_align(date_label, LV_ALIGN_TOP_MID, 0, 35);
     }
-    lv_obj_set_style_text_font(date_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(date_label, lv_color_hex(0xfbbf24), 0);
-    lv_obj_align(date_label, LV_ALIGN_TOP_MID, 0, 10);
     
     // 创建星期显示（在日期下方）
-    lv_obj_t* weekday_label = lv_label_create(screen_weather);
     if (time_valid) {
+        lv_obj_t* weekday_label = lv_label_create(screen_weather);
         const char* weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
         lv_label_set_text(weekday_label, weekdays[timeinfo.tm_wday]);
-    } else {
-        if (WiFi.status() != WL_CONNECTED) {
-            lv_label_set_text(weekday_label, "Connect WiFi in Settings");
-        } else {
-            lv_label_set_text(weekday_label, "Waiting for time sync...");
-        }
+        lv_obj_set_style_text_font(weekday_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(weekday_label, lv_color_hex(0xe5e7eb), 0);
+        lv_obj_align(weekday_label, LV_ALIGN_TOP_MID, 0, 55);
     }
-    lv_obj_set_style_text_font(weekday_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(weekday_label, lv_color_hex(0xe5e7eb), 0);
-    lv_obj_align(weekday_label, LV_ALIGN_TOP_MID, 0, 30);
     
-    // 创建天气标题
-    lv_obj_t* title_label = lv_label_create(screen_weather);
-    lv_label_set_text(title_label, LV_SYMBOL_SETTINGS " Weather");
-    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(title_label, lv_color_hex(0xf1f5f9), 0);
-    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 55);
-    
-    // 创建天气信息容器（缩小尺寸）
+    // 创建天气信息容器（恢复正常位置）
     lv_obj_t* weather_container = lv_obj_create(screen_weather);
-    lv_obj_set_size(weather_container, 260, 140);
+    lv_obj_set_size(weather_container, 260, 160);
     lv_obj_align(weather_container, LV_ALIGN_CENTER, 0, 10);
     lv_obj_set_style_bg_color(weather_container, lv_color_hex(0x1a1a2e), 0);
     lv_obj_set_style_border_width(weather_container, 0, 0);
     lv_obj_set_style_radius(weather_container, 20, 0);
     lv_obj_clear_flag(weather_container, LV_OBJ_FLAG_SCROLLABLE);
     
-    // 温度显示
-    lv_obj_t* temp_label = lv_label_create(weather_container);
-    lv_label_set_text(temp_label, "25°C");
-    lv_obj_set_style_text_font(temp_label, &lv_font_montserrat_48, 0);
-    lv_obj_set_style_text_color(temp_label, lv_color_hex(0xfbbf24), 0);
-    lv_obj_align(temp_label, LV_ALIGN_CENTER, 0, -20);
+    // 添加长按事件，用于切换城市
+    lv_obj_add_event_cb(weather_container, [](lv_event_t * e) {
+        lv_event_code_t code = lv_event_get_code(e);
+        if (code == LV_EVENT_LONG_PRESSED) {
+            Serial.println("天气容器被长按，打开城市选择界面");
+            create_city_input_screen();
+            lv_scr_load_anim(screen_city_input, LV_SCR_LOAD_ANIM_MOVE_BOTTOM, 200, 0, false);
+        }
+    }, LV_EVENT_LONG_PRESSED, NULL);
     
-    // 天气状况
-    lv_obj_t* condition_label = lv_label_create(weather_container);
-    lv_label_set_text(condition_label, "Sunny");
-    lv_obj_set_style_text_font(condition_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(condition_label, lv_color_hex(0xe5e7eb), 0);
-    lv_obj_align(condition_label, LV_ALIGN_CENTER, 0, 20);
+    // 位置显示（保存全局引用）
+    weather_location_label = lv_label_create(weather_container);
+    String locationName = getLocationName(userLocation);
+    lv_label_set_text(weather_location_label, locationName.c_str());
+    lv_obj_set_style_text_font(weather_location_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(weather_location_label, lv_color_hex(0x9ca3af), 0);
+    lv_obj_align(weather_location_label, LV_ALIGN_CENTER, 0, -50);
     
-    // 湿度信息
-    lv_obj_t* humidity_label = lv_label_create(weather_container);
-    lv_label_set_text(humidity_label, "Humidity: 65%");
-    lv_obj_set_style_text_font(humidity_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(humidity_label, lv_color_hex(0x9ca3af), 0);
-    lv_obj_align(humidity_label, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+    // 温度显示（保存全局引用）
+    weather_temp_label = lv_label_create(weather_container);
+    lv_label_set_text(weather_temp_label, isWeatherDataValid ? (String(currentTemperature, 1) + "°C").c_str() : "--°C");
+    lv_obj_set_style_text_font(weather_temp_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(weather_temp_label, lv_color_hex(0xfbbf24), 0);
+    lv_obj_align(weather_temp_label, LV_ALIGN_CENTER, 0, -10);
     
-    // 风速信息
-    lv_obj_t* wind_label = lv_label_create(weather_container);
-    lv_label_set_text(wind_label, "Wind: 5 km/h");
-    lv_obj_set_style_text_font(wind_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(wind_label, lv_color_hex(0x9ca3af), 0);
-    lv_obj_align(wind_label, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+    // 天气状况（保存全局引用）- 使用英文显示
+    weather_condition_label = lv_label_create(weather_container);
+    if (isWeatherDataValid) {
+        String englishWeather = translateWeatherToEnglish(currentWeatherCondition);
+        lv_label_set_text(weather_condition_label, englishWeather.c_str());
+    } else {
+        lv_label_set_text(weather_condition_label, "Loading...");
+    }
+    lv_obj_set_style_text_font(weather_condition_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(weather_condition_label, lv_color_hex(0xe5e7eb), 0);
+    lv_obj_align(weather_condition_label, LV_ALIGN_CENTER, 0, 20);
     
-    // 提示信息
-    lv_obj_t* hint_label = lv_label_create(screen_weather);
-    lv_label_set_text(hint_label, "Swipe left to return to main screen");
-    lv_obj_set_style_text_font(hint_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(hint_label, lv_color_hex(0x6b7280), 0);
-    lv_obj_align(hint_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+    // 湿度信息（保存全局引用）
+    weather_humidity_label = lv_label_create(weather_container);
+    lv_label_set_text(weather_humidity_label, isWeatherDataValid ? ("Humidity: " + String(currentHumidity, 0) + "%").c_str() : "Humidity: --%");
+    lv_obj_set_style_text_font(weather_humidity_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(weather_humidity_label, lv_color_hex(0x9ca3af), 0);
+    lv_obj_align(weather_humidity_label, LV_ALIGN_BOTTOM_LEFT, 5, -10);
+    
+    // 风速信息（保存全局引用）
+    weather_wind_label = lv_label_create(weather_container);
+    lv_label_set_text(weather_wind_label, isWeatherDataValid ? ("Wind: " + String(currentWindSpeed, 1) + " km/h").c_str() : "Wind: -- km/h");
+    lv_obj_set_style_text_font(weather_wind_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(weather_wind_label, lv_color_hex(0x9ca3af), 0);
+    lv_obj_align(weather_wind_label, LV_ALIGN_BOTTOM_RIGHT, -5, -10);
+    
+    // 如果天气数据无效且WiFi已连接，尝试获取天气数据
+    if (!isWeatherDataValid && WiFi.status() == WL_CONNECTED) {
+        Serial.println("天气界面：开始获取天气数据");
+        fetchWeatherData();
+    }
+    
+    // 添加调试按钮（手动刷新天气数据）- 与主页刷新按钮样式一致，位置在左上角
+    lv_obj_t* refresh_btn = lv_btn_create(screen_weather);
+    lv_obj_set_size(refresh_btn, 40, 40);
+    lv_obj_align(refresh_btn, LV_ALIGN_TOP_LEFT, 10, 10);
+    lv_obj_set_style_radius(refresh_btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(refresh_btn, lv_color_hex(0x007BFF), 0);
+    
+    lv_obj_t* refresh_label = lv_label_create(refresh_btn);
+    lv_label_set_text(refresh_label, LV_SYMBOL_REFRESH);
+    lv_obj_center(refresh_label);
+    lv_obj_set_style_text_font(refresh_label, &lv_font_montserrat_16, 0);
+    
+    // 添加按钮点击事件
+    lv_obj_add_event_cb(refresh_btn, [](lv_event_t * e) {
+        lv_event_code_t code = lv_event_get_code(e);
+        if (code == LV_EVENT_CLICKED) {
+            Serial.println("手动刷新天气数据");
+            if (WiFi.status() == WL_CONNECTED) {
+                fetchWeatherData();
+            } else {
+                Serial.println("WiFi未连接，无法获取天气数据");
+            }
+        }
+    }, LV_EVENT_CLICKED, NULL);
+    
+
+    
+    // 创建页面指示器
+    createPageIndicator(screen_weather);
+    
+    // 设置天气页为当前页面（索引0）
+    updatePageIndicator(0);
     
     Serial.println("天气界面创建完成");
 }
@@ -2137,6 +2848,8 @@ void create_calendar_screen() {
                 if (main_screen != NULL) {
                     lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
                     control_buttons_visibility(main_screen);
+                    // 更新页面指示器状态
+                    updatePageIndicator(1);
                 } else {
                     Serial.println("错误：main_screen为NULL");
                 }
@@ -2144,13 +2857,6 @@ void create_calendar_screen() {
         }
     }, LV_EVENT_GESTURE, NULL);
     lv_obj_clear_flag(screen_calendar, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    
-    // 创建标题
-    lv_obj_t* title_label = lv_label_create(screen_calendar);
-    lv_label_set_text(title_label, "Calendar");
-    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title_label, lv_color_hex(0xf1f5f9), 0);
-    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 15);
     
     // 获取当前真实时间（统一声明）
     struct tm timeinfo;
@@ -2168,64 +2874,42 @@ void create_calendar_screen() {
         }
     }
     
-    // 创建合并的日历容器（包含日期显示和月历）
+    // 创建日期显示（在屏幕顶部）
+    if (time_valid) {
+        lv_obj_t* date_label = lv_label_create(screen_calendar);
+        char date_str[20];
+        strftime(date_str, sizeof(date_str), "%Y-%m-%d", &timeinfo);
+        lv_label_set_text(date_label, date_str);
+        lv_obj_set_style_text_font(date_label, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(date_label, lv_color_hex(0xfbbf24), 0);
+        lv_obj_align(date_label, LV_ALIGN_TOP_MID, 0, 10);
+    }
+    
+    // 创建星期显示（在日期下方）
+    if (time_valid) {
+        lv_obj_t* weekday_label = lv_label_create(screen_calendar);
+        const char* weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+        lv_label_set_text(weekday_label, weekdays[timeinfo.tm_wday]);
+        lv_obj_set_style_text_font(weekday_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(weekday_label, lv_color_hex(0xe5e7eb), 0);
+        lv_obj_align(weekday_label, LV_ALIGN_TOP_MID, 0, 35);
+    }
+    
+    // 创建日历标题
+    lv_obj_t* title_label = lv_label_create(screen_calendar);
+    lv_label_set_text(title_label, "Calendar");
+    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(title_label, lv_color_hex(0xf1f5f9), 0);
+    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 60);
+    
+    // 创建日历容器（移到最下面）
     lv_obj_t* calendar_container = lv_obj_create(screen_calendar);
-    lv_obj_set_size(calendar_container, 280, 220);
-    lv_obj_align(calendar_container, LV_ALIGN_CENTER, 0, -20);
+    lv_obj_set_size(calendar_container, 260, 140);
+    lv_obj_align(calendar_container, LV_ALIGN_BOTTOM_MID, 0, -40);
     lv_obj_set_style_bg_color(calendar_container, lv_color_hex(0x1a1a2e), 0);
     lv_obj_set_style_border_width(calendar_container, 0, 0);
     lv_obj_set_style_radius(calendar_container, 20, 0);
     lv_obj_clear_flag(calendar_container, LV_OBJ_FLAG_SCROLLABLE);
-    
-    // 当前日期显示
-    lv_obj_t* date_label = lv_label_create(calendar_container);
-    if (time_valid) {
-        char date_str[20];
-        strftime(date_str, sizeof(date_str), "%Y-%m-%d", &timeinfo);
-        lv_label_set_text(date_label, date_str);
-    } else {
-        if (WiFi.status() != WL_CONNECTED) {
-            lv_label_set_text(date_label, "No WiFi Connection");
-        } else {
-            lv_label_set_text(date_label, "Time Sync Failed");
-        }
-    }
-    lv_obj_set_style_text_font(date_label, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(date_label, lv_color_hex(0xfbbf24), 0);
-    lv_obj_align(date_label, LV_ALIGN_TOP_MID, 0, 10);
-    
-    // 星期显示
-    lv_obj_t* weekday_label = lv_label_create(calendar_container);
-    if (time_valid) {
-        const char* weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
-        lv_label_set_text(weekday_label, weekdays[timeinfo.tm_wday]);
-    } else {
-        if (WiFi.status() != WL_CONNECTED) {
-            lv_label_set_text(weekday_label, "Connect WiFi in Settings");
-        } else {
-            lv_label_set_text(weekday_label, "Waiting for time sync...");
-        }
-    }
-    lv_obj_set_style_text_font(weekday_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(weekday_label, lv_color_hex(0xe5e7eb), 0);
-    lv_obj_align(weekday_label, LV_ALIGN_TOP_MID, 0, 35);
-    
-    // 月份标题
-    lv_obj_t* month_label = lv_label_create(calendar_container);
-    if (time_valid) {
-        char month_str[20];
-        strftime(month_str, sizeof(month_str), "%B %Y", &timeinfo);
-        lv_label_set_text(month_label, month_str);
-    } else {
-        if (WiFi.status() != WL_CONNECTED) {
-            lv_label_set_text(month_label, "No Network");
-        } else {
-            lv_label_set_text(month_label, "Syncing Time...");
-        }
-    }
-    lv_obj_set_style_text_font(month_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(month_label, lv_color_hex(0xf1f5f9), 0);
-    lv_obj_align(month_label, LV_ALIGN_TOP_MID, 0, 60);
     
     // 星期标题行
     const char* weekdays[] = {"S", "M", "T", "W", "T", "F", "S"};
@@ -2234,7 +2918,7 @@ void create_calendar_screen() {
         lv_label_set_text(day_header, weekdays[i]);
         lv_obj_set_style_text_font(day_header, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(day_header, lv_color_hex(0x9ca3af), 0);
-        lv_obj_align(day_header, LV_ALIGN_TOP_LEFT, 25 + i * 35, 85);
+        lv_obj_align(day_header, LV_ALIGN_TOP_LEFT, 20 + i * 32, 15);
     }
     
     // 示例日期网格（简化版）
@@ -2256,17 +2940,18 @@ void create_calendar_screen() {
                     lv_obj_set_style_text_color(day_label, lv_color_hex(0xe5e7eb), 0);
                 }
                 
-                lv_obj_align(day_label, LV_ALIGN_TOP_LEFT, 25 + day * 35, 105 + week * 25);
+                lv_obj_align(day_label, LV_ALIGN_TOP_LEFT, 20 + day * 32, 35 + week * 22);
             }
         }
     }
     
-    // 提示信息
-    lv_obj_t* hint_label = lv_label_create(screen_calendar);
-    lv_label_set_text(hint_label, "Swipe right to return to main screen");
-    lv_obj_set_style_text_font(hint_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(hint_label, lv_color_hex(0x6b7280), 0);
-    lv_obj_align(hint_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+    
+    // 创建页面指示器
+    createPageIndicator(screen_calendar);
+    
+    // 设置日历页为当前页面（索引2）
+    updatePageIndicator(2);
     
     Serial.println("日历界面创建完成");
 }
@@ -2487,13 +3172,17 @@ void fetchGitHubData() {
     delay(500); // 短暂延时确保UI刷新
     Serial.println("[DEBUG] 开始HTTP请求流程...");
 
-    // 配置HTTP客户端，准备API请求
+    // 配置HTTPS客户端，准备API请求
+    WiFiClientSecure client;
     HTTPClient http;
     String url = "https://api.github.com/repos/" + String(repoOwner) + "/" + String(repoName);
-    Serial.println("配置HTTP客户端...");
+    Serial.println("配置HTTPS客户端...");
     Serial.printf("请求URL: %s\n", url.c_str());
     
-    http.begin(url);  // 设置请求URL
+    // 配置安全客户端（跳过证书验证）
+    client.setInsecure();
+    
+    http.begin(client, url);  // 设置请求URL
     http.addHeader("Authorization", "Bearer " + String(githubToken));  // 添加认证头
     http.addHeader("User-Agent", "ESP32-GitHub-Display");  // 添加User-Agent（GitHub API要求）
     http.setTimeout(15000);  // 设置15秒超时
@@ -2979,7 +3668,8 @@ void updateProgressBar() {
         } else {
             // 计算剩余时间百分比（从100%递减到0%）
             int progress = 100 - (timeSinceUpdate * 100) / UPDATE_INTERVAL;
-            lv_bar_set_value(progress_bar, progress > 0 ? progress : 0, LV_ANIM_ON);
+            lv_bar_set_value(progress_bar, progress > 0 ? progress : 0, LV_ANIM_OFF);
+
         }
     } else {
         // 从未更新过数据，隐藏进度条
@@ -3044,6 +3734,9 @@ void setup() {
 
     // 从NVS（非易失性存储）加载用户配置（WiFi凭据、GitHub设置等）
     load_settings();
+    
+    // 加载天气设置
+    loadWeatherSettings();
     
     // 检查是否是新的一天并更新昨日数据
     checkAndUpdateDailyData();
@@ -3136,6 +3829,10 @@ void setup() {
         
         fetchGitHubData();  // 获取GitHub数据（会显示"Fetching data..."状态）
         lastDataUpdate = millis();  // 记录数据更新时间
+        
+        // 获取天气数据
+        fetchWeatherData();  // 获取天气数据
+        lastWeatherUpdate = millis();  // 记录天气数据更新时间
     } else {
         // WiFi连接失败，提示用户进入设置
         updateStatus("Configure WiFi in Settings", lv_color_hex(0xfbbf24));
@@ -3165,8 +3862,8 @@ void loop() {
     
     // LVGL图形库必需的处理函数，处理UI事件、动画等
     lv_timer_handler();
-    lv_tick_inc(5);  // 增加LVGL内部时钟计数
-    delay(5);        // 短暂延时，避免CPU占用过高
+    lv_tick_inc(1);  // 增加LVGL内部时钟计数
+    delay(1);        // 短暂延时，避免CPU占用过高
 
     unsigned long currentMillis = millis();  // 获取当前时间戳，用于定时任务
 
@@ -3241,6 +3938,41 @@ void loop() {
         lastDataUpdate = currentMillis;  // 更新最后数据获取时间
     }
     
+    // 定时获取天气数据（每10分钟更新一次，仅在WiFi连接时执行）
+    if (WiFi.status() == WL_CONNECTED && currentMillis - lastWeatherUpdate >= WEATHER_UPDATE_INTERVAL) {
+        Serial.println("定时更新天气数据");
+        fetchWeatherData();          // 获取最新的天气数据
+        lastWeatherUpdate = currentMillis;  // 更新最后天气数据获取时间
+    }
+    
+    // 检查是否需要在特定时间自动刷新天气数据（早上8点、中午12点、晚上6点）
+    static unsigned long lastWeatherTimeCheck = 0;
+    if (WiFi.status() == WL_CONNECTED && currentMillis - lastWeatherTimeCheck >= 60000) { // 每分钟检查一次
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo)) {
+            int currentHour = timeinfo.tm_hour;
+            int currentMinute = timeinfo.tm_min;
+            
+            // 检查是否是指定的刷新时间（8:00, 12:00, 18:00）
+            if ((currentHour == 8 || currentHour == 12 || currentHour == 18) && currentMinute == 0) {
+                // 检查是否已经在这个小时内刷新过（避免重复刷新）
+                static int lastAutoRefreshHour = -1;
+                if (lastAutoRefreshHour != currentHour) {
+                    Serial.printf("自动天气刷新时间到：%02d:00\n", currentHour);
+                    fetchWeatherData();
+                    lastWeatherUpdate = currentMillis;
+                    lastAutoRefreshHour = currentHour;
+                    
+                    // 如果当前在天气界面，立即更新显示
+                    if (lv_scr_act() == screen_weather && isWeatherDataValid) {
+                        updateWeatherDisplay();
+                    }
+                }
+            }
+        }
+        lastWeatherTimeCheck = currentMillis;
+    }
+    
     // 定时更新当前时间显示（每秒更新一次）
     static unsigned long lastCurrentTimeUpdate = 0;
     if (currentMillis - lastCurrentTimeUpdate >= 1000) {
@@ -3258,10 +3990,11 @@ void loop() {
         lastTimeUpdate = currentMillis;
     }
     
-    // 定时更新进度条（手动刷新时每100ms更新一次，正常时每5秒更新一次）
-    unsigned long progressUpdateInterval = isManualRefreshing ? 100 : 5000;
+    // 定时更新进度条（手动刷新时每100ms更新一次，正常时每1秒更新一次）
+    unsigned long progressUpdateInterval = isManualRefreshing ? 100 : 1000;
     if (currentMillis - lastProgressUpdate >= progressUpdateInterval) {
         updateProgressBar();
+
         lastProgressUpdate = currentMillis;
     }
     
@@ -3283,11 +4016,13 @@ void loop() {
     if (!wasConnected && currentlyConnected) {
         // WiFi重新连接后，重置所有相关状态
         lastDataUpdate = 0;          // 重置数据更新时间，触发立即更新
+        lastWeatherUpdate = 0;     // 重置天气数据更新时间，触发立即更新
         showingUpdateSuccess = false; // 清除更新成功状态
         updateSuccessTime = 0;       // 重置更新成功时间
         networkErrorShowing = false; // 重置网络错误状态，允许再次显示错误消息框
         // 立即更新显示界面
         fetchGitHubData();
+        fetchWeatherData();          // 获取天气数据
         Serial.println("WiFi重新连接，状态已重置");
     }
     
