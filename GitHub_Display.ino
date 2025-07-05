@@ -3288,23 +3288,23 @@ void create_calendar_screen() {
     lv_obj_set_style_text_color(title_label, lv_color_hex(0xf1f5f9), 0);
     lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 60);
     
-    // 创建日历容器（移到最下面）
+    // 创建日历容器（保持原始大小，调整位置避免遮盖）
     lv_obj_t* calendar_container = lv_obj_create(screen_calendar);
-    lv_obj_set_size(calendar_container, 260, 140);
-    lv_obj_align(calendar_container, LV_ALIGN_BOTTOM_MID, 0, -40);
+    lv_obj_set_size(calendar_container, 280, 160);  // 保持合适大小
+    lv_obj_align(calendar_container, LV_ALIGN_BOTTOM_MID, 0, -30);  // 向下调整位置
     lv_obj_set_style_bg_color(calendar_container, lv_color_hex(0x1a1a2e), 0);
     lv_obj_set_style_border_width(calendar_container, 0, 0);
     lv_obj_set_style_radius(calendar_container, 20, 0);
     lv_obj_clear_flag(calendar_container, LV_OBJ_FLAG_SCROLLABLE);
     
-    // 星期标题行
+    // 星期标题行（调整间距）
     const char* weekdays[] = {"S", "M", "T", "W", "T", "F", "S"};
     for (int i = 0; i < 7; i++) {
         lv_obj_t* day_header = lv_label_create(calendar_container);
         lv_label_set_text(day_header, weekdays[i]);
         lv_obj_set_style_text_font(day_header, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(day_header, lv_color_hex(0x9ca3af), 0);
-        lv_obj_align(day_header, LV_ALIGN_TOP_LEFT, 20 + i * 32, 15);
+        lv_obj_align(day_header, LV_ALIGN_TOP_LEFT, 25 + i * 35, 12);  // 调整间距和位置
     }
     
     // 正确的日期网格（根据实际星期排列）
@@ -3356,10 +3356,21 @@ void create_calendar_screen() {
             prev_month_days = 31;
         }
         
-        // 绘制完整的6周日历网格（包括上个月和下个月的日期）
-        for (int week = 0; week < 6; week++) {
+        // 计算需要显示的周数（智能显示，避免过多下个月日期）
+        int total_cells_needed = first_weekday + days_in_month;
+        int weeks_needed = (total_cells_needed + 6) / 7;  // 向上取整
+        if (weeks_needed > 5) weeks_needed = 5;  // 最多显示5周
+        
+        // 绘制优化的日历网格（减少不必要的下个月日期）
+        for (int week = 0; week < weeks_needed; week++) {
             for (int day = 0; day < 7; day++) {
                 int date_num = week * 7 + day + 1 - first_weekday;
+                
+                // 跳过超出必要范围的下个月日期
+                if (date_num > days_in_month && date_num > days_in_month + 2) {
+                    continue;  // 只显示下个月的1-2号
+                }
+                
                 lv_obj_t* day_label = lv_label_create(calendar_container);
                 char day_text[4];
                 
@@ -3371,12 +3382,18 @@ void create_calendar_screen() {
                     lv_obj_set_style_text_font(day_label, &lv_font_montserrat_12, 0);
                     lv_obj_set_style_text_color(day_label, lv_color_hex(0x6b7280), 0);  // 灰色表示上个月
                 } else if (date_num > days_in_month) {
-                    // 下个月的日期
+                    // 下个月的日期（只显示1-2号）
                     int next_date = date_num - days_in_month;
-                    snprintf(day_text, sizeof(day_text), "%d", next_date);
-                    lv_label_set_text(day_label, day_text);
-                    lv_obj_set_style_text_font(day_label, &lv_font_montserrat_12, 0);
-                    lv_obj_set_style_text_color(day_label, lv_color_hex(0x6b7280), 0);  // 灰色表示下个月
+                    if (next_date <= 2) {  // 只显示下个月的1-2号
+                        snprintf(day_text, sizeof(day_text), "%d", next_date);
+                        lv_label_set_text(day_label, day_text);
+                        lv_obj_set_style_text_font(day_label, &lv_font_montserrat_12, 0);
+                        lv_obj_set_style_text_color(day_label, lv_color_hex(0x6b7280), 0);  // 灰色表示下个月
+                    } else {
+                        // 不显示过多的下个月日期，删除这个标签
+                        lv_obj_del(day_label);
+                        continue;
+                    }
                 } else {
                     // 当前月的日期
                     snprintf(day_text, sizeof(day_text), "%d", date_num);
@@ -3395,7 +3412,7 @@ void create_calendar_screen() {
                     }
                 }
                 
-                lv_obj_align(day_label, LV_ALIGN_TOP_LEFT, 20 + day * 32, 35 + week * 22);
+                lv_obj_align(day_label, LV_ALIGN_TOP_LEFT, 25 + day * 35, 32 + week * 18);  // 调整行间距
             }
         }
     } else {
