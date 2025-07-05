@@ -3235,12 +3235,28 @@ void create_calendar_screen() {
     // 检查WiFi连接状态和时间同步
     if (WiFi.status() == WL_CONNECTED) {
         time_valid = getLocalTime(&timeinfo);
-        if (!time_valid) {
+        if (time_valid) {
+            // 输出详细的时间调试信息
+            const char* debug_weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+            Serial.println("=== 日历界面时间调试信息 ===");
+            Serial.printf("年份: %d, 月份: %d, 日期: %d\n", timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+            Serial.printf("星期: %s (tm_wday=%d)\n", debug_weekdays[timeinfo.tm_wday], timeinfo.tm_wday);
+            Serial.printf("时间: %02d:%02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+            Serial.println("================================");
+        } else {
             // 如果NTP时间获取失败，尝试重新配置时间
             Serial.println("日历界面：NTP时间获取失败，尝试重新同步");
             configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
             delay(1000);
             time_valid = getLocalTime(&timeinfo);
+            if (time_valid) {
+                const char* debug_weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+                Serial.println("=== 重新同步后的时间信息 ===");
+                Serial.printf("年份: %d, 月份: %d, 日期: %d\n", timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+                Serial.printf("星期: %s (tm_wday=%d)\n", debug_weekdays[timeinfo.tm_wday], timeinfo.tm_wday);
+                Serial.printf("时间: %02d:%02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+                Serial.println("==============================");
+            }
         }
     }
     
@@ -3291,31 +3307,105 @@ void create_calendar_screen() {
         lv_obj_align(day_header, LV_ALIGN_TOP_LEFT, 20 + i * 32, 15);
     }
     
-    // 示例日期网格（简化版）
-    int current_day = time_valid ? timeinfo.tm_mday : 15;
-    for (int week = 0; week < 4; week++) {
-        for (int day = 0; day < 7; day++) {
-            int date_num = week * 7 + day + 1;
-            if (date_num <= 28) {
+    // 正确的日期网格（根据实际星期排列）
+    if (time_valid) {
+        int current_day = timeinfo.tm_mday;
+        int current_month = timeinfo.tm_mon;
+        int current_year = timeinfo.tm_year + 1900;
+        
+        // 计算当月第一天是星期几
+        struct tm first_day = {0};
+        first_day.tm_year = current_year - 1900;
+        first_day.tm_mon = current_month;
+        first_day.tm_mday = 1;
+        mktime(&first_day);  // 计算星期几
+        int first_weekday = first_day.tm_wday;  // 0=Sunday, 1=Monday, ..., 6=Saturday
+        
+        // 计算当月天数
+        int days_in_month;
+        if (current_month == 1) {  // 2月
+            bool is_leap = (current_year % 4 == 0 && current_year % 100 != 0) || (current_year % 400 == 0);
+            days_in_month = is_leap ? 29 : 28;
+        } else if (current_month == 3 || current_month == 5 || current_month == 8 || current_month == 10) {  // 4,6,9,11月
+            days_in_month = 30;
+        } else {  // 1,3,5,7,8,10,12月
+            days_in_month = 31;
+        }
+        
+        Serial.printf("=== 日历布局调试信息 ===\n");
+        Serial.printf("当前日期: %d年%d月%d日\n", current_year, current_month + 1, current_day);
+        Serial.printf("当月第一天是星期: %d (0=Sunday)\n", first_weekday);
+        Serial.printf("当月总天数: %d\n", days_in_month);
+        Serial.printf("========================\n");
+        
+        // 计算上个月的天数
+        int prev_month = current_month - 1;
+        int prev_year = current_year;
+        if (prev_month < 0) {
+            prev_month = 11;
+            prev_year--;
+        }
+        
+        int prev_month_days;
+        if (prev_month == 1) {  // 2月
+            bool is_leap = (prev_year % 4 == 0 && prev_year % 100 != 0) || (prev_year % 400 == 0);
+            prev_month_days = is_leap ? 29 : 28;
+        } else if (prev_month == 3 || prev_month == 5 || prev_month == 8 || prev_month == 10) {  // 4,6,9,11月
+            prev_month_days = 30;
+        } else {  // 1,3,5,7,8,10,12月
+            prev_month_days = 31;
+        }
+        
+        // 绘制完整的6周日历网格（包括上个月和下个月的日期）
+        for (int week = 0; week < 6; week++) {
+            for (int day = 0; day < 7; day++) {
+                int date_num = week * 7 + day + 1 - first_weekday;
                 lv_obj_t* day_label = lv_label_create(calendar_container);
                 char day_text[4];
-                snprintf(day_text, sizeof(day_text), "%d", date_num);
-                lv_label_set_text(day_label, day_text);
-                lv_obj_set_style_text_font(day_label, &lv_font_montserrat_12, 0);
                 
-                // 高亮当前日期
-                if (date_num == current_day) {
-                    lv_obj_set_style_text_color(day_label, lv_color_hex(0xfbbf24), 0);
+                if (date_num < 1) {
+                    // 上个月的日期
+                    int prev_date = prev_month_days + date_num;
+                    snprintf(day_text, sizeof(day_text), "%d", prev_date);
+                    lv_label_set_text(day_label, day_text);
+                    lv_obj_set_style_text_font(day_label, &lv_font_montserrat_12, 0);
+                    lv_obj_set_style_text_color(day_label, lv_color_hex(0x6b7280), 0);  // 灰色表示上个月
+                } else if (date_num > days_in_month) {
+                    // 下个月的日期
+                    int next_date = date_num - days_in_month;
+                    snprintf(day_text, sizeof(day_text), "%d", next_date);
+                    lv_label_set_text(day_label, day_text);
+                    lv_obj_set_style_text_font(day_label, &lv_font_montserrat_12, 0);
+                    lv_obj_set_style_text_color(day_label, lv_color_hex(0x6b7280), 0);  // 灰色表示下个月
                 } else {
-                    lv_obj_set_style_text_color(day_label, lv_color_hex(0xe5e7eb), 0);
+                    // 当前月的日期
+                    snprintf(day_text, sizeof(day_text), "%d", date_num);
+                    lv_label_set_text(day_label, day_text);
+                    lv_obj_set_style_text_font(day_label, &lv_font_montserrat_12, 0);
+                    
+                    // 高亮当前日期
+                    if (date_num == current_day) {
+                        lv_obj_set_style_text_color(day_label, lv_color_hex(0xfbbf24), 0);  // 黄色高亮当天
+                        // 添加背景高亮
+                        lv_obj_set_style_bg_color(day_label, lv_color_hex(0x3b82f6), 0);
+                        lv_obj_set_style_bg_opa(day_label, LV_OPA_30, 0);
+                        lv_obj_set_style_radius(day_label, 8, 0);
+                    } else {
+                        lv_obj_set_style_text_color(day_label, lv_color_hex(0xe5e7eb), 0);  // 白色表示当前月其他日期
+                    }
                 }
                 
                 lv_obj_align(day_label, LV_ALIGN_TOP_LEFT, 20 + day * 32, 35 + week * 22);
             }
         }
+    } else {
+        // 如果时间无效，显示提示信息
+        lv_obj_t* error_label = lv_label_create(calendar_container);
+        lv_label_set_text(error_label, "Time sync required");
+        lv_obj_set_style_text_font(error_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(error_label, lv_color_hex(0xef4444), 0);
+        lv_obj_center(error_label);
     }
-    
-
     
     // 创建页面指示器
     createPageIndicator(screen_calendar);
@@ -3505,10 +3595,43 @@ void handleSerialCommands() {
         if (command == "test_anim") {
             Serial.println("=== 开始测试数字滚动动画 ===");
             testNumberAnimation();
+        } else if (command == "show_time") {
+            Serial.println("=== 当前时间信息 ===");
+            struct tm timeinfo;
+            if (getLocalTime(&timeinfo)) {
+                const char* weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+                Serial.printf("年份: %d\n", timeinfo.tm_year + 1900);
+                Serial.printf("月份: %d\n", timeinfo.tm_mon + 1);
+                Serial.printf("日期: %d\n", timeinfo.tm_mday);
+                Serial.printf("星期: %s (tm_wday=%d)\n", weekdays[timeinfo.tm_wday], timeinfo.tm_wday);
+                Serial.printf("时间: %02d:%02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+                Serial.printf("完整日期: %04d-%02d-%02d %s\n", 
+                    timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, weekdays[timeinfo.tm_wday]);
+            } else {
+                Serial.println("无法获取时间信息，请检查NTP同步状态");
+            }
+        } else if (command.startsWith("set_timezone ")) {
+            String timezoneStr = command.substring(12);
+            int timezone = timezoneStr.toInt();
+            Serial.printf("=== 设置时区为 UTC%+d ===\n", timezone);
+            configTime(timezone * 3600, 0, "pool.ntp.org", "time.nist.gov");
+            Serial.println("等待时间同步...");
+            delay(2000);
+            struct tm timeinfo;
+            if (getLocalTime(&timeinfo)) {
+                const char* weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+                Serial.printf("时区设置成功！当前时间: %04d-%02d-%02d %s %02d:%02d:%02d\n", 
+                    timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, 
+                    weekdays[timeinfo.tm_wday], timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+            } else {
+                Serial.println("时区设置后无法获取时间，请检查网络连接");
+            }
         } else if (command.length() > 0) {
             Serial.println("未知命令: " + command);
             Serial.println("支持的命令:");
             Serial.println("  test_anim - 测试数字滚动动画");
+            Serial.println("  show_time - 显示当前时间信息");
+            Serial.println("  set_timezone <offset> - 设置时区 (例如: set_timezone 8 表示UTC+8)");
         }
     }
 }
@@ -4264,6 +4387,15 @@ void initDisplayAndTouch() {
  * 5. 创建所有UI界面
  * 6. 尝试WiFi连接和数据获取
  * 7. 启动定时更新机制
+ * 
+ * 时区设置说明：
+ * 如果您发现日历显示的星期和日期不匹配，请检查时区设置。
+ * 在configTime函数中修改第一个参数（时区偏移量）：
+ * - 中国时区 (UTC+8): 8 * 3600
+ * - 日本时区 (UTC+9): 9 * 3600  
+ * - 美国东部 (UTC-5): -5 * 3600
+ * - 美国西部 (UTC-8): -8 * 3600
+ * - 英国时区 (UTC+0): 0 * 3600
  */
 void setup() {
     // 初始化串口通信，波特率115200，用于调试输出
@@ -4342,6 +4474,11 @@ void setup() {
     lv_scr_load(main_screen);
     if (connectWiFi()) {
         // WiFi连接成功，配置时区并获取GitHub数据
+        // 注意：如果您不在中国时区，请修改时区偏移量
+        // UTC+8 (中国): 8 * 3600
+        // UTC+0 (格林威治): 0 * 3600  
+        // UTC-5 (美国东部): -5 * 3600
+        // UTC-8 (美国西部): -8 * 3600
         configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");  // 设置中国时区(UTC+8)
         
         // 等待NTP时间同步
@@ -4359,6 +4496,15 @@ void setup() {
             char timeStr[64];
             strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
             Serial.printf("当前时间: %s\n", timeStr);
+            
+            // 详细的时间调试信息
+            const char* weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+            Serial.printf("详细时间信息:\n");
+            Serial.printf("  年份: %d\n", timeinfo.tm_year + 1900);
+            Serial.printf("  月份: %d\n", timeinfo.tm_mon + 1);
+            Serial.printf("  日期: %d\n", timeinfo.tm_mday);
+            Serial.printf("  星期: %s (tm_wday=%d)\n", weekdays[timeinfo.tm_wday], timeinfo.tm_wday);
+            Serial.printf("  时间: %02d:%02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
         } else {
             Serial.println("NTP时间同步失败，使用默认时间");
         }
