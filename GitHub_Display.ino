@@ -1187,6 +1187,360 @@ String processWindPowerDisplay(const String& windPower) {
     return processed;
 }
 
+// 图表动画相关变量
+static lv_coord_t* chart_target_data = NULL;  // 目标数据数组
+static lv_coord_t* chart_current_data = NULL; // 当前动画数据数组
+static int chart_anim_data_count = 0;  // 动画数据点数量
+static bool chart_animation_running = false;  // 动画运行状态
+
+/**
+ * 图表数据点动画回调函数
+ * 功能：实现数据点从底部平滑上升到目标值的动画效果
+ * 参数：var - 动画变量（数据点索引），val - 动画进度值(0-100)
+ */
+static void chart_data_anim_cb(void* var, int32_t val) {
+    if (!chart_animation_running || chart_target_data == NULL || chart_current_data == NULL) {
+        return;
+    }
+    
+    int point_index = (int)(intptr_t)var;
+    
+    // 计算当前数据点的动画值
+    if (point_index < chart_anim_data_count) {
+        // 使用缓出曲线，让动画更自然
+        float progress = val / 100.0f;
+        progress = 1.0f - (1.0f - progress) * (1.0f - progress);  // 缓出效果
+        
+        chart_current_data[point_index] = (lv_coord_t)(chart_target_data[point_index] * progress);
+        
+        // 更新图表显示
+        updateChartDisplayWithAnimation();
+    }
+}
+
+/**
+ * 图表整体动画完成回调函数
+ * 功能：动画完成后的清理工作
+ */
+static void chart_anim_ready_cb(lv_anim_t* a) {
+    chart_animation_running = false;
+    Serial.println("图表动画完成");
+    
+    // 确保最终显示正确的数据
+    if (chart_target_data != NULL && chart_current_data != NULL) {
+        for (int i = 0; i < chart_anim_data_count; i++) {
+            chart_current_data[i] = chart_target_data[i];
+        }
+        updateChartDisplayWithAnimation();
+    }
+}
+
+/**
+ * 启动图表数据动画（无参数版本）
+ * 功能：使用全局chart_data数组启动动画
+ */
+void startChartAnimation() {
+    startChartAnimation(chart_data, chart_data_count);
+}
+
+/**
+ * 启动图表数据动画
+ * 功能：为图表数据点创建平滑的上升动画效果
+ * 参数：target_data - 目标数据数组，data_count - 数据点数量
+ */
+void startChartAnimation(lv_coord_t* target_data, int data_count) {
+    if (chart_obj == NULL || chart_series == NULL || target_data == NULL || data_count <= 0) {
+        Serial.println("图表动画启动失败：参数无效");
+        return;
+    }
+    
+    Serial.println("启动图表数据动画");
+    
+    // 停止现有动画
+    if (chart_animation_running) {
+        lv_anim_del_all();
+    }
+    
+    // 分配内存
+    if (chart_target_data != NULL) {
+        free(chart_target_data);
+    }
+    if (chart_current_data != NULL) {
+        free(chart_current_data);
+    }
+    
+    chart_target_data = (lv_coord_t*)malloc(data_count * sizeof(lv_coord_t));
+    chart_current_data = (lv_coord_t*)malloc(data_count * sizeof(lv_coord_t));
+    
+    if (chart_target_data == NULL || chart_current_data == NULL) {
+        Serial.println("图表动画内存分配失败");
+        return;
+    }
+    
+    // 复制目标数据并初始化当前数据为0
+    for (int i = 0; i < data_count; i++) {
+        chart_target_data[i] = target_data[i];
+        chart_current_data[i] = 0;
+    }
+    
+    chart_anim_data_count = data_count;
+    chart_animation_running = true;
+    
+    // 根据数据点数量动态调整延迟时间（最多10个数据点）
+    int base_delay = (data_count > 7) ? 30 : 50;  // 数据点较多时减少延迟
+    int anim_duration = 300;  // 固定动画时长
+    
+    // 为每个数据点创建动画，添加延迟让数据点依次出现
+    for (int i = 0; i < data_count; i++) {
+        lv_anim_t anim;
+        lv_anim_init(&anim);
+        lv_anim_set_var(&anim, (void*)(intptr_t)i);  // 传递数据点索引
+        lv_anim_set_values(&anim, 0, 100);  // 0-100的进度值
+        lv_anim_set_time(&anim, anim_duration);  // 动态调整动画时长
+        lv_anim_set_delay(&anim, i * base_delay);  // 动态调整延迟时间
+        lv_anim_set_exec_cb(&anim, chart_data_anim_cb);
+        lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);  // 缓出动画曲线
+        
+        // 只为最后一个数据点设置完成回调
+        if (i == data_count - 1) {
+            lv_anim_set_ready_cb(&anim, chart_anim_ready_cb);
+        }
+        
+        lv_anim_start(&anim);
+    }
+}
+
+/**
+ * 带动画的图表显示更新函数
+ * 功能：在动画过程中更新图表显示，不包含标签创建
+ */
+void updateChartDisplayWithAnimation() {
+    if (chart_obj == NULL || chart_series == NULL || chart_current_data == NULL) {
+        return;
+    }
+    
+    // 清除现有数据
+    lv_chart_set_point_count(chart_obj, chart_anim_data_count);
+    
+    // 设置当前动画数据
+    for (int i = 0; i < chart_anim_data_count; i++) {
+        lv_chart_set_next_value(chart_obj, chart_series, chart_current_data[i]);
+    }
+    
+    // 自动调整Y轴范围（基于目标数据）
+    if (chart_anim_data_count > 0 && chart_target_data != NULL) {
+        lv_coord_t minVal = chart_target_data[0];
+        lv_coord_t maxVal = chart_target_data[0];
+        
+        for (int i = 1; i < chart_anim_data_count; i++) {
+            if (chart_target_data[i] < minVal) minVal = chart_target_data[i];
+            if (chart_target_data[i] > maxVal) maxVal = chart_target_data[i];
+        }
+        
+        // 添加一些边距
+        lv_coord_t range = maxVal - minVal;
+        lv_coord_t margin = range * 0.1;  // 10%边距
+        if (margin < 1) margin = 1;
+        
+        lv_chart_set_range(chart_obj, LV_CHART_AXIS_PRIMARY_Y, minVal - margin, maxVal + margin);
+    }
+    
+    lv_obj_invalidate(chart_obj);  // 刷新图表显示
+}
+
+/**
+ * 定时器回调函数：延迟创建图表标签
+ * 功能：用于定时器回调，创建图表标签后删除定时器
+ */
+static void chart_labels_timer_cb(lv_timer_t* timer) {
+    updateChartLabels();
+    lv_timer_del(timer);
+}
+
+/**
+ * 更新图表标签显示
+ * 功能：创建和更新图表的数据点标签和坐标轴标签
+ */
+void updateChartLabels() {
+    if (chart_obj == NULL || chart_target_data == NULL || chart_anim_data_count <= 0) {
+        return;
+    }
+    
+    lv_obj_t* parent = lv_obj_get_parent(chart_obj);
+    
+    // 根据数据点数量动态调整标签延迟时间（最多10个数据点）
+    int base_delay = (chart_anim_data_count > 7) ? 30 : 50;
+    int label_base_offset = (chart_anim_data_count > 7) ? 150 : 200;
+    int x_label_base_offset = (chart_anim_data_count > 7) ? 180 : 250;
+    
+    // 获取图表区域信息
+    lv_area_t chart_area;
+    lv_obj_get_coords(chart_obj, &chart_area);
+    int chart_width = lv_area_get_width(&chart_area);
+    int chart_height = lv_area_get_height(&chart_area);
+    
+    // 计算数据范围
+    lv_coord_t minVal = chart_target_data[0];
+    lv_coord_t maxVal = chart_target_data[0];
+    
+    for (int i = 1; i < chart_anim_data_count; i++) {
+        if (chart_target_data[i] < minVal) minVal = chart_target_data[i];
+        if (chart_target_data[i] > maxVal) maxVal = chart_target_data[i];
+    }
+    
+    // 添加边距
+    lv_coord_t range = maxVal - minVal;
+    lv_coord_t margin = range * 0.1;
+    if (margin < 1) margin = 1;
+    
+    // 定义容器边界变量
+    lv_coord_t container_left_narrow = chart_area.x1 - 10;
+    lv_coord_t container_right_narrow = chart_area.x2 + 10;
+    lv_coord_t container_top = chart_area.y1 - 30;
+    lv_coord_t container_left_wide = chart_area.x1 - 20;
+    lv_coord_t container_right_wide = chart_area.x2 + 20;
+    
+    for (int i = 0; i < chart_anim_data_count; i++) {
+        // 计算数据点在图表中的位置
+        lv_coord_t x_pos;
+        if (chart_anim_data_count == 1) {
+            x_pos = chart_area.x1 + chart_width / 2;
+        } else {
+            x_pos = chart_area.x1 + (i * chart_width) / (chart_anim_data_count - 1);
+        }
+        lv_coord_t y_pos;
+        if (maxVal - minVal + 2 * margin == 0) {
+            y_pos = chart_area.y1 + chart_height / 2;
+        } else {
+            y_pos = chart_area.y2 - ((chart_target_data[i] - minVal + margin) * chart_height) / (maxVal - minVal + 2 * margin);
+        }
+        
+        // 创建数据点数值标签
+        lv_obj_t* value_label = lv_label_create(parent);
+        lv_label_set_text_fmt(value_label, "%d", chart_target_data[i]);
+        lv_obj_set_style_text_font(value_label, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(value_label, lv_color_hex(0xfbbf24), 0);
+        
+        // 添加标签出现动画
+        lv_obj_set_style_opa(value_label, LV_OPA_TRANSP, 0);
+        lv_anim_t label_anim;
+        lv_anim_init(&label_anim);
+        lv_anim_set_var(&label_anim, value_label);
+        lv_anim_set_values(&label_anim, LV_OPA_TRANSP, LV_OPA_COVER);
+        lv_anim_set_time(&label_anim, 300);
+        lv_anim_set_delay(&label_anim, i * base_delay + label_base_offset);  // 在数据点动画后出现
+        lv_anim_set_exec_cb(&label_anim, (lv_anim_exec_xcb_t)lv_obj_set_style_opa);
+        lv_anim_set_path_cb(&label_anim, lv_anim_path_ease_in_out);
+        lv_anim_start(&label_anim);
+        
+        // 获取标签尺寸以实现精确居中
+        lv_obj_update_layout(value_label);
+        lv_coord_t label_width = lv_obj_get_width(value_label);
+        lv_coord_t label_height = lv_obj_get_height(value_label);
+        
+        // 检查是否所有数据相同
+        bool all_same = true;
+        for (int j = 1; j < chart_anim_data_count; j++) {
+            if (chart_target_data[j] != chart_target_data[0]) {
+                all_same = false;
+                break;
+            }
+        }
+        
+        // 获取父容器坐标
+        lv_area_t parent_area;
+        lv_obj_get_coords(parent, &parent_area);
+        
+        // 计算标签位置
+        lv_coord_t value_label_x = x_pos - label_width / 2;
+        lv_coord_t value_label_y;
+        
+        if (all_same) {
+            if (i % 2 == 0) {
+                value_label_y = y_pos - label_height - 10;
+            } else {
+                value_label_y = y_pos + 1;
+            }
+        } else {
+            value_label_y = y_pos - label_height - 2;
+        }
+        
+        // 转换为相对坐标
+        value_label_x -= parent_area.x1;
+        value_label_y -= parent_area.y1;
+        
+        // 限制标签位置
+        lv_coord_t container_left_rel = container_left_narrow - parent_area.x1;
+        lv_coord_t container_right_rel = container_right_narrow - parent_area.x1;
+        lv_coord_t container_top_rel = container_top - parent_area.y1;
+        lv_coord_t container_bottom_rel = (chart_area.y2 + 30) - parent_area.y1;
+        
+        if (value_label_x < container_left_rel) value_label_x = container_left_rel;
+        if (value_label_x + label_width > container_right_rel) value_label_x = container_right_rel - label_width;
+        if (value_label_y < container_top_rel) value_label_y = container_top_rel;
+        if (value_label_y + label_height > container_bottom_rel) value_label_y = container_bottom_rel - label_height;
+        
+        lv_obj_set_pos(value_label, value_label_x, value_label_y);
+        lv_obj_set_user_data(value_label, (void*)0x1234);
+        
+        // 创建横坐标标签
+        lv_obj_t* x_label = lv_label_create(parent);
+        lv_obj_set_style_text_font(x_label, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(x_label, lv_color_hex(0x94a3b8), 0);
+        lv_obj_set_user_data(x_label, (void*)0x5678);
+        
+        // 添加横坐标标签出现动画
+        lv_obj_set_style_opa(x_label, LV_OPA_TRANSP, 0);
+        lv_anim_t x_label_anim;
+        lv_anim_init(&x_label_anim);
+        lv_anim_set_var(&x_label_anim, x_label);
+        lv_anim_set_values(&x_label_anim, LV_OPA_TRANSP, LV_OPA_COVER);
+        lv_anim_set_time(&x_label_anim, 300);
+        lv_anim_set_delay(&x_label_anim, i * base_delay + x_label_base_offset);  // 在数值标签后出现
+        lv_anim_set_exec_cb(&x_label_anim, (lv_anim_exec_xcb_t)lv_obj_set_style_opa);
+        lv_anim_set_path_cb(&x_label_anim, lv_anim_path_ease_in_out);
+        lv_anim_start(&x_label_anim);
+        
+        // 根据图表模式设置横坐标标签文本
+        if (chart_view_mode == 0) {
+            if (i == chart_anim_data_count - 1) {
+                lv_label_set_text(x_label, "now");
+            } else {
+                lv_label_set_text_fmt(x_label, "-%d", chart_anim_data_count - 1 - i);
+            }
+        } else if (chart_view_mode == 1) {
+            const char* weekdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+            time_t now = time(NULL);
+            struct tm* timeinfo = localtime(&now);
+            int today_weekday = timeinfo->tm_wday;
+            int day_offset = chart_anim_data_count - 1 - i;
+            int weekday = (today_weekday - day_offset + 7) % 7;
+            lv_label_set_text(x_label, weekdays[weekday]);
+        } else if (chart_view_mode == 2) {
+            lv_label_set_text_fmt(x_label, "G%d", i + 1);
+        }
+        
+        // 获取横坐标标签尺寸
+        lv_obj_update_layout(x_label);
+        lv_coord_t x_label_width = lv_obj_get_width(x_label);
+        lv_coord_t x_label_x = x_pos - x_label_width / 2;
+        lv_coord_t x_label_y = chart_area.y2 - 2;
+        
+        // 转换为相对坐标
+        x_label_x -= parent_area.x1;
+        x_label_y -= parent_area.y1;
+        
+        // 限制标签位置
+        lv_coord_t container_left_wide_rel = container_left_wide - parent_area.x1;
+        lv_coord_t container_right_wide_rel = container_right_wide - parent_area.x1;
+        
+        if (x_label_x < container_left_wide_rel) x_label_x = container_left_wide_rel;
+        if (x_label_x + x_label_width > container_right_wide_rel) x_label_x = container_right_wide_rel - x_label_width;
+        
+        lv_obj_set_pos(x_label, x_label_x, x_label_y);
+    }
+}
+
 /**
  * 将中文天气状况转换为英文
  * 功能：将高德天气API返回的中文天气描述转换为对应的英文描述
@@ -4561,12 +4915,14 @@ void updateChartDisplay() {
         child = next;
     }
     
-    // 清除现有数据
-    lv_chart_set_point_count(chart_obj, chart_data_count);
-    
-    // 设置数据
-    for (int i = 0; i < chart_data_count; i++) {
-        lv_chart_set_next_value(chart_obj, chart_series, chart_data[i]);
+    // 启动数据动画而不是直接设置数据
+    if (chart_data_count > 0) {
+        startChartAnimation();
+        
+        // 延迟创建标签，等待动画开始
+        lv_timer_t* label_timer = lv_timer_create(chart_labels_timer_cb, 50, NULL);  // 50ms后创建标签
+        
+        return;  // 动画期间不执行后续的标签创建代码
     }
     
     // 自动调整Y轴范围
