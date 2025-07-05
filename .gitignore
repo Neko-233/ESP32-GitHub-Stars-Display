@@ -10,3 +10,5 @@
 secrets.h
 .vscode.DS_Store
 .vscode/
+.DS_Store
+.vscode/
