@@ -250,7 +250,7 @@ lv_obj_t *weather_location_label;  // 天气位置显示标签
 lv_obj_t *weather_temp_label;      // 天气温度显示标签
 lv_obj_t *weather_condition_label; // 天气状况显示标签
 lv_obj_t *weather_humidity_label;  // 湿度显示标签
-lv_obj_t *weather_wind_label;      // 风速显示标签
+lv_obj_t *weather_wind_label;      // 风力等级显示标签
 
 // ===== 页面指示器相关变量 =====
 lv_obj_t *page_indicator_main;     // 主页面指示器容器
@@ -278,7 +278,7 @@ time_t lastDailySaveTime = 0;           // 上次每日保存的时间戳
 // ===== 天气数据相关变量 =====
 float currentTemperature = 0.0;         // 当前温度（摄氏度）
 int currentHumidity = 0;                // 当前湿度（百分比）
-float currentWindSpeed = 0.0;           // 当前风速（km/h）
+String currentWindPower = "";           // 当前风力等级
 String currentWeatherCondition = "Unknown"; // 当前天气状况
 String currentLocation = "Unknown";     // 当前位置
 unsigned long lastWeatherUpdate = 0;    // 上次天气更新时间戳（毫秒）
@@ -1037,8 +1037,8 @@ void fetchWeatherData() {
     
     if (isWeatherDataValid && (timeSinceLastUpdate < WEATHER_UPDATE_INTERVAL)) {
         Serial.printf("天气数据仍然有效，跳过更新 (剩余时间: %lu毫秒)\n", WEATHER_UPDATE_INTERVAL - timeSinceLastUpdate);
-        Serial.printf("[DEBUG] 当前天气数据: 温度=%.1f°C, 湿度=%d%%, 风速=%.1fkm/h, 天气=%s\n", 
-                      currentTemperature, currentHumidity, currentWindSpeed, currentWeatherCondition.c_str());
+        Serial.printf("[DEBUG] 当前天气数据: 温度=%.1f°C, 湿度=%d%%, 风力等级=%s, 天气=%s\n",
+                  currentTemperature, currentHumidity, currentWindPower.c_str(), currentWeatherCondition.c_str());
         return;
     }
     
@@ -1102,18 +1102,8 @@ void fetchWeatherData() {
             // 提取湿度（百分比）
             currentHumidity = weather["humidity"].as<int>();
             
-            // 提取风力等级（转换为大概的风速）
-            String windpower = weather["windpower"].as<String>();
-            // 简单转换：≤3级约为10km/h，4-5级约为20km/h，6-7级约为35km/h
-            if (windpower.indexOf("≤3") >= 0) {
-                currentWindSpeed = 10.0;
-            } else if (windpower.indexOf("4") >= 0 || windpower.indexOf("5") >= 0) {
-                currentWindSpeed = 20.0;
-            } else if (windpower.indexOf("6") >= 0 || windpower.indexOf("7") >= 0) {
-                currentWindSpeed = 35.0;
-            } else {
-                currentWindSpeed = 15.0; // 默认值
-            }
+            // 提取风力等级（直接使用API返回的windpower值）
+            currentWindPower = weather["windpower"].as<String>();
             
             // 提取天气描述
             currentWeatherCondition = weather["weather"].as<String>();
@@ -1125,7 +1115,7 @@ void fetchWeatherData() {
             Serial.printf("[DEBUG] 天气数据更新成功:\n");
             Serial.printf("[DEBUG] - 温度: %.1f°C\n", currentTemperature);
             Serial.printf("[DEBUG] - 湿度: %d%%\n", currentHumidity);
-            Serial.printf("[DEBUG] - 风速: %.1fkm/h\n", currentWindSpeed);
+            Serial.printf("[DEBUG] - 风力等级: %s\n", currentWindPower.c_str());
             Serial.printf("[DEBUG] - 天气状况: %s\n", currentWeatherCondition.c_str());
             Serial.printf("[DEBUG] - 位置ID: %s\n", userLocation.c_str());
             Serial.printf("[DEBUG] - 更新时间戳: %lu\n", lastWeatherUpdate);
@@ -1278,7 +1268,7 @@ String getCityLocationId(const String& cityName) {
 
 /**
  * 更新天气显示函数
- * 功能：更新天气界面上的位置、温度、湿度、风速和天气状况显示
+ * 功能：更新天气界面上的位置、温度、湿度、风力等级和天气状况显示
  */
 void updateWeatherDisplay() {
     Serial.printf("[DEBUG] updateWeatherDisplay: screen_weather=%p, isWeatherDataValid=%s\n", 
@@ -1323,10 +1313,10 @@ void updateWeatherDisplay() {
     }
     
     if (weather_wind_label != NULL) {
-        lv_label_set_text_fmt(weather_wind_label, "Wind: %.1f km/h", currentWindSpeed);
-        Serial.printf("[DEBUG] - 风速标签已更新: %.1fkm/h\n", currentWindSpeed);
+        lv_label_set_text_fmt(weather_wind_label, "Wind: %s lvl", currentWindPower.c_str());
+        Serial.printf("[DEBUG] - 风力等级标签已更新: %s\n", currentWindPower.c_str());
     } else {
-        Serial.println("[DEBUG] - 风速标签为NULL，跳过更新");
+        Serial.println("[DEBUG] - 风力等级标签为NULL，跳过更新");
     }
     
     Serial.println("[DEBUG] updateWeatherDisplay: 所有天气显示元素更新完成");
@@ -2776,9 +2766,9 @@ void create_weather_screen() {
     lv_obj_set_style_text_color(weather_humidity_label, lv_color_hex(0x9ca3af), 0);
     lv_obj_align(weather_humidity_label, LV_ALIGN_BOTTOM_LEFT, 5, -10);
     
-    // 风速信息（保存全局引用）
+    // 风力等级信息（保存全局引用）
     weather_wind_label = lv_label_create(weather_container);
-    lv_label_set_text(weather_wind_label, isWeatherDataValid ? ("Wind: " + String(currentWindSpeed, 1) + " km/h").c_str() : "Wind: -- km/h");
+    lv_label_set_text(weather_wind_label, isWeatherDataValid ? ("Wind: " + currentWindPower + " lvl").c_str() : "Wind: --");
     lv_obj_set_style_text_font(weather_wind_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(weather_wind_label, lv_color_hex(0x9ca3af), 0);
     lv_obj_align(weather_wind_label, LV_ALIGN_BOTTOM_RIGHT, -5, -10);
@@ -3122,6 +3112,103 @@ bool connectWiFi() {
 }
 
 /**
+ * 串口命令处理函数
+ * 功能：监听串口输入，处理动画测试命令
+ * 支持的命令：
+ * - "test_anim" - 测试数字滚动动画效果
+ */
+void handleSerialCommands() {
+    if (Serial.available()) {
+        String command = Serial.readStringUntil('\n');
+        command.trim();  // 移除首尾空白字符
+        
+        if (command == "test_anim") {
+            Serial.println("=== 开始测试数字滚动动画 ===");
+            testNumberAnimation();
+        } else if (command.length() > 0) {
+            Serial.println("未知命令: " + command);
+            Serial.println("支持的命令:");
+            Serial.println("  test_anim - 测试数字滚动动画");
+        }
+    }
+}
+
+/**
+ * 数字滚动动画测试函数
+ * 功能：测试数字从当前值变到另一个值再变回来的动画效果
+ * 特点：不改变实际数据，仅用于测试动画效果
+ */
+void testNumberAnimation() {
+    // 保存当前的真实数据值
+    int originalStars = currentStars;
+    int originalForks = currentForks;
+    int originalWatchers = currentWatchers;
+    
+    // 保存当前的动画状态
+    int originalAnimatingStars = animatingStars;
+    int originalAnimatingForks = animatingForks;
+    int originalAnimatingWatchers = animatingWatchers;
+    
+    Serial.printf("当前数据 - Stars: %d, Forks: %d, Watchers: %d\n", originalStars, originalForks, originalWatchers);
+    Serial.printf("当前动画状态 - Stars: %d, Forks: %d, Watchers: %d\n", originalAnimatingStars, originalAnimatingForks, originalAnimatingWatchers);
+    
+    // 第一阶段：从当前值动画到测试值
+    Serial.println("第一阶段：数字增加动画");
+    if (animatingStars >= 0) {
+        int testStars = animatingStars + 100;  // 增加100个星标
+        Serial.printf("Stars动画: %d -> %d\n", animatingStars, testStars);
+        animateNumber(stars_count_label, animatingStars, testStars, "");
+        animatingStars = testStars;
+    }
+    
+    if (animatingForks >= 0) {
+        int testForks = animatingForks + 20;   // 增加20个分支
+        Serial.printf("Forks动画: %d -> %d\n", animatingForks, testForks);
+        animateNumber(forks_label, animatingForks, testForks, "Forks: ");
+        animatingForks = testForks;
+    }
+    
+    if (animatingWatchers >= 0) {
+        int testWatchers = animatingWatchers + 10;  // 增加10个关注者
+        Serial.printf("Watchers动画: %d -> %d\n", animatingWatchers, testWatchers);
+        animateNumber(watchers_label, animatingWatchers, testWatchers, "Watchers: ");
+        animatingWatchers = testWatchers;
+    }
+    
+    // 延迟2秒后执行第二阶段
+    Serial.println("等待2秒后执行第二阶段...");
+    delay(2000);
+    
+    // 第二阶段：从测试值动画回原始值
+    Serial.println("第二阶段：数字恢复动画");
+    if (originalAnimatingStars >= 0) {
+        Serial.printf("Stars恢复动画: %d -> %d\n", animatingStars, originalAnimatingStars);
+        animateNumber(stars_count_label, animatingStars, originalAnimatingStars, "");
+        animatingStars = originalAnimatingStars;
+    }
+    
+    if (originalAnimatingForks >= 0) {
+        Serial.printf("Forks恢复动画: %d -> %d\n", animatingForks, originalAnimatingForks);
+        animateNumber(forks_label, animatingForks, originalAnimatingForks, "Forks: ");
+        animatingForks = originalAnimatingForks;
+    }
+    
+    if (originalAnimatingWatchers >= 0) {
+        Serial.printf("Watchers恢复动画: %d -> %d\n", animatingWatchers, originalAnimatingWatchers);
+        animateNumber(watchers_label, animatingWatchers, originalAnimatingWatchers, "Watchers: ");
+        animatingWatchers = originalAnimatingWatchers;
+    }
+    
+    // 确保实际数据值不变
+    currentStars = originalStars;
+    currentForks = originalForks;
+    currentWatchers = originalWatchers;
+    
+    Serial.println("=== 动画测试完成，数据已恢复原始值 ===");
+    Serial.printf("恢复后数据 - Stars: %d, Forks: %d, Watchers: %d\n", currentStars, currentForks, currentWatchers);
+}
+
+/**
  * GitHub API数据获取函数
  * 功能：从GitHub REST API获取指定仓库的统计数据
  * 获取数据：Stars数量、Forks数量、Watchers数量
@@ -3148,15 +3235,18 @@ void fetchGitHubData() {
     Serial.println("[DEBUG] 设置 isFetchingData = true");
     isFetchingData = true;
     
-    // 在开始获取数据时，将显示重置为占位符
-    Serial.println("重置数据显示为占位符...");
-    lv_label_set_text(stars_count_label, "---");
-    lv_label_set_text(forks_label, "Forks: --");
-    lv_label_set_text(watchers_label, "Watchers: --");
-    // 重置动画状态
-    animatingStars = -1;
-    animatingForks = -1;
-    animatingWatchers = -1;
+    // 只在开机第一次或当前显示为占位符时重置显示
+    // 检查当前是否显示占位符（开机第一次或数据无效状态）
+    const char* current_stars_text = lv_label_get_text(stars_count_label);
+    bool isFirstTime = (strcmp(current_stars_text, "---") == 0);
+    
+    if (isFirstTime) {
+        Serial.println("开机第一次获取数据，保持占位符显示...");
+        // 保持占位符显示，动画状态已经是-1
+    } else {
+        Serial.println("数据更新，保持当前数字显示，准备使用数字滚动动画...");
+        // 不重置显示和动画状态，让updateDisplay使用数字到数字的动画
+    }
     lv_timer_handler();  // 刷新UI显示
     
     Serial.println("WiFi连接正常，开始数据获取流程...");
@@ -3230,6 +3320,13 @@ void fetchGitHubData() {
             Serial.printf("=== 调用saveStarData前，currentStars值: %d ===\n", currentStars);
             saveStarData(currentStars);
             Serial.printf("=== 调用saveStarData后，currentStars值: %d ===\n", currentStars);
+            
+            // 保存增长数据（包括增加和减少的变化）
+            saveGrowthData(currentStars);
+            
+            // 更新上次保存的星标数并持久化
+            lastSavedStars = currentStars;
+            save_settings();  // 立即保存到NVS，确保重启后数据不丢失
             
             // 完成进度条到100%
             lv_bar_set_value(progress_bar, 100, LV_ANIM_ON);
@@ -3342,41 +3439,82 @@ static void number_anim_cb(void* var, int32_t val) {
 }
 
 /**
- * 从占位符到数字的动画回调函数
- * 功能：创建从占位符(---)到实际数字的过渡动画
+ * 从占位符到数字的动画回调函数（优化版）
+ * 功能：创建从占位符到实际数字的平滑过渡动画
  * 参数：var - 指向标签对象的指针，val - 当前动画值(0-100)
+ * 优化特点：
+ * - 使用透明度渐变实现更平滑的过渡
+ * - 添加数字逐步显现效果
+ * - 减少闪烁，提升视觉体验
  */
 static void placeholder_to_number_anim_cb(void* var, int32_t val) {
     lv_obj_t* label = (lv_obj_t*)var;
     
-    if (val < 50) {
-        // 前半段：显示占位符闪烁效果
-        if ((val / 10) % 2 == 0) {
-            if (label == stars_count_label) {
-                lv_label_set_text(label, "---");
-            } else if (label == forks_label) {
-                lv_label_set_text(label, "Forks: --");
-            } else if (label == watchers_label) {
-                lv_label_set_text(label, "Watchers: --");
-            }
-        } else {
-            if (label == stars_count_label) {
-                lv_label_set_text(label, "...");
-            } else if (label == forks_label) {
-                lv_label_set_text(label, "Forks: ..");
-            } else if (label == watchers_label) {
-                lv_label_set_text(label, "Watchers: ..");
-            }
-        }
-    } else {
-        // 后半段：显示实际数字
+    // 计算透明度和进度
+    lv_opa_t opacity = LV_OPA_COVER;
+    
+    if (val < 30) {
+        // 第一阶段：占位符淡出效果 (0-30%)
+        opacity = LV_OPA_COVER - (val * LV_OPA_COVER / 30);
+        
         if (label == stars_count_label) {
-            lv_label_set_text_fmt(label, "%d", currentStars);
+            lv_label_set_text(label, "---");
         } else if (label == forks_label) {
-            lv_label_set_text_fmt(label, "Forks: %d", currentForks);
+            lv_label_set_text(label, "Forks: --");
         } else if (label == watchers_label) {
-            lv_label_set_text_fmt(label, "Watchers: %d", currentWatchers);
+            lv_label_set_text(label, "Watchers: --");
         }
+        
+        // 设置透明度
+        lv_obj_set_style_text_opa(label, opacity, 0);
+        
+    } else if (val < 70) {
+        // 第二阶段：加载动画 (30-70%)
+        int dots = ((val - 30) / 10) % 4; // 0-3个点的循环
+        char loading_text[20];
+        
+        if (label == stars_count_label) {
+            snprintf(loading_text, sizeof(loading_text), "%.*s", dots, "...");
+            lv_label_set_text(label, loading_text);
+        } else if (label == forks_label) {
+            snprintf(loading_text, sizeof(loading_text), "Forks: %.*s", dots, "...");
+            lv_label_set_text(label, loading_text);
+        } else if (label == watchers_label) {
+            snprintf(loading_text, sizeof(loading_text), "Watchers: %.*s", dots, "...");
+            lv_label_set_text(label, loading_text);
+        }
+        
+        // 透明度逐渐恢复
+        opacity = LV_OPA_30 + ((val - 30) * (LV_OPA_COVER - LV_OPA_30) / 40);
+        lv_obj_set_style_text_opa(label, opacity, 0);
+        
+    } else {
+        // 第三阶段：数字淡入效果 (70-100%)
+        int target_value = 0;
+        
+        // 获取目标数值
+        if (label == stars_count_label) {
+            target_value = currentStars;
+        } else if (label == forks_label) {
+            target_value = currentForks;
+        } else if (label == watchers_label) {
+            target_value = currentWatchers;
+        }
+        
+        // 数字逐步显现效果
+        int progress = val - 70; // 0-30的进度
+        int current_display = (target_value * progress) / 30;
+        
+        if (label == stars_count_label) {
+            lv_label_set_text_fmt(label, "%d", current_display);
+        } else if (label == forks_label) {
+            lv_label_set_text_fmt(label, "Forks: %d", current_display);
+        } else if (label == watchers_label) {
+            lv_label_set_text_fmt(label, "Watchers: %d", current_display);
+        }
+        
+        // 完全不透明
+        lv_obj_set_style_text_opa(label, LV_OPA_COVER, 0);
     }
 }
 
@@ -3400,9 +3538,13 @@ void animateNumber(lv_obj_t* label, int from, int to, const char* prefix) {
 }
 
 /**
- * 从占位符到数字的动画函数
- * 功能：创建从占位符(---)到实际数字的过渡动画
+ * 从占位符到数字的动画函数（优化版）
+ * 功能：创建从占位符到实际数字的平滑过渡动画
  * 参数：label - 目标标签
+ * 优化特点：
+ * - 使用更平滑的动画曲线
+ * - 优化动画时长以配合三阶段效果
+ * - 添加动画完成后的清理逻辑
  */
 void animatePlaceholderToNumber(lv_obj_t* label) {
     // 创建动画对象
@@ -3410,9 +3552,26 @@ void animatePlaceholderToNumber(lv_obj_t* label) {
     lv_anim_init(&anim);
     lv_anim_set_var(&anim, label);
     lv_anim_set_values(&anim, 0, 100);  // 0-100的进度值
-    lv_anim_set_time(&anim, 1200);  // 动画持续时间1.2秒
+    lv_anim_set_time(&anim, 1800);  // 动画持续时间1.8秒，配合三阶段效果
     lv_anim_set_exec_cb(&anim, placeholder_to_number_anim_cb);
-    lv_anim_set_path_cb(&anim, lv_anim_path_ease_in_out);  // 使用缓入缓出动画曲线
+    lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);  // 使用缓出动画曲线，更自然
+    
+    // 添加动画完成回调，确保最终状态正确
+     lv_anim_set_ready_cb(&anim, [](lv_anim_t* a) {
+         lv_obj_t* label = (lv_obj_t*)a->var;
+         // 确保透明度完全恢复
+         lv_obj_set_style_text_opa(label, LV_OPA_COVER, 0);
+         
+         // 确保显示最终正确的数值
+         if (label == stars_count_label && currentStars >= 0) {
+             lv_label_set_text_fmt(label, "%d", currentStars);
+         } else if (label == forks_label && currentForks >= 0) {
+             lv_label_set_text_fmt(label, "Forks: %d", currentForks);
+         } else if (label == watchers_label && currentWatchers >= 0) {
+             lv_label_set_text_fmt(label, "Watchers: %d", currentWatchers);
+         }
+     });
+    
     lv_anim_start(&anim);
 }
 
@@ -3860,6 +4019,9 @@ void loop() {
     // 静态变量声明，用于WiFi状态监控
     static bool wasConnected = true;
     
+    // 处理串口命令（用于动画测试）
+    handleSerialCommands();
+    
     // LVGL图形库必需的处理函数，处理UI事件、动画等
     lv_timer_handler();
     lv_tick_inc(1);  // 增加LVGL内部时钟计数
@@ -4056,9 +4218,6 @@ void saveStarData(int starCount) {
     
     Serial.printf("已保存数据: 时间戳=%lu, 星标=%d\n", now, starCount);
     
-    // 同时保存增长数据（如果有增长）
-    saveGrowthData(starCount);
-    
     // 检查文件大小，如果超过限制则清理旧数据
     file = LittleFS.open(DATA_FILE, "r");
     if (file) {
@@ -4160,17 +4319,26 @@ void saveDailyStarData(int starCount) {
 
 /**
  * 保存增长数据
- * 功能：只保存有增长的数据点，用于增长图表显示
+ * 功能：保存所有星标变化（增加和减少），用于增长趋势图表显示
  */
 void saveGrowthData(int starCount) {
-    // 检查是否有增长
-    if (lastSavedStars >= 0 && starCount <= lastSavedStars) {
-        Serial.printf("星标数无增长 (%d -> %d)，跳过保存\n", lastSavedStars, starCount);
+    // 检查是否有变化（只有在有上次数据且数值发生变化时才保存）
+    if (lastSavedStars >= 0 && starCount == lastSavedStars) {
+        Serial.printf("星标数无变化 (%d -> %d)，跳过保存\n", lastSavedStars, starCount);
         return;
     }
     
     Serial.println("=== 保存增长数据 ===");
-    Serial.printf("=== 检测到增长: %d -> %d ===\n", lastSavedStars, starCount);
+    if (lastSavedStars >= 0) {
+        int change = starCount - lastSavedStars;
+        if (change > 0) {
+            Serial.printf("=== 检测到增长: %d -> %d (+%d) ===\n", lastSavedStars, starCount, change);
+        } else {
+            Serial.printf("=== 检测到减少: %d -> %d (%d) ===\n", lastSavedStars, starCount, change);
+        }
+    } else {
+        Serial.printf("=== 首次保存增长数据: %d ===\n", starCount);
+    }
     
     // 获取当前时间戳
     time_t now;
@@ -4224,9 +4392,6 @@ void saveGrowthData(int starCount) {
             }
         }
     }
-    
-    // 更新上次保存的星标数
-    lastSavedStars = starCount;
 }
 
 /**
