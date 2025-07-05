@@ -1102,8 +1102,9 @@ void fetchWeatherData() {
             // 提取湿度（百分比）
             currentHumidity = weather["humidity"].as<int>();
             
-            // 提取风力等级（直接使用API返回的windpower值）
-            currentWindPower = weather["windpower"].as<String>();
+            // 提取风力等级（直接使用API返回的windpower值，并处理特殊符号）
+            String rawWindPower = weather["windpower"].as<String>();
+            currentWindPower = processWindPowerDisplay(rawWindPower);
             
             // 提取天气描述
             currentWeatherCondition = weather["weather"].as<String>();
@@ -1161,6 +1162,29 @@ String getLocationName(const String& locationId) {
     // 如果没有找到匹配的城市，返回默认格式
     Serial.printf("未找到位置ID %s 对应的城市\n", locationId.c_str());
     return "Location " + locationId;
+}
+
+/**
+ * 处理风力等级显示字符串
+ * 功能：将API返回的风力等级字符串中的特殊符号替换为更适合显示的表达
+ * 参数：windPower - 原始风力等级字符串
+ * 返回：处理后的风力等级字符串
+ */
+String processWindPowerDisplay(const String& windPower) {
+    String processed = windPower;
+    
+    // 替换≤符号为更适合显示的表达
+    processed.replace("≤", "<=");
+    
+    // 替换≥符号为更适合显示的表达
+    processed.replace("≥", ">=");
+    
+    // 替换其他可能的特殊符号
+    processed.replace("＜", "<");
+    processed.replace("＞", ">");
+    processed.replace("～", "-");
+    
+    return processed;
 }
 
 /**
@@ -1313,8 +1337,9 @@ void updateWeatherDisplay() {
     }
     
     if (weather_wind_label != NULL) {
-        lv_label_set_text_fmt(weather_wind_label, "Wind: %s lvl", currentWindPower.c_str());
-        Serial.printf("[DEBUG] - 风力等级标签已更新: %s\n", currentWindPower.c_str());
+        String displayWindPower = processWindPowerDisplay(currentWindPower);
+        lv_label_set_text_fmt(weather_wind_label, "Wind: %s lvl", displayWindPower.c_str());
+        Serial.printf("[DEBUG] - 风力等级标签已更新: %s (原始: %s)\n", displayWindPower.c_str(), currentWindPower.c_str());
     } else {
         Serial.println("[DEBUG] - 风力等级标签为NULL，跳过更新");
     }
@@ -2768,7 +2793,8 @@ void create_weather_screen() {
     
     // 风力等级信息（保存全局引用）
     weather_wind_label = lv_label_create(weather_container);
-    lv_label_set_text(weather_wind_label, isWeatherDataValid ? ("Wind: " + currentWindPower + " lvl").c_str() : "Wind: --");
+    String displayWindPower = isWeatherDataValid ? processWindPowerDisplay(currentWindPower) : "--";
+    lv_label_set_text(weather_wind_label, isWeatherDataValid ? ("Wind: " + displayWindPower + " lvl").c_str() : "Wind: --");
     lv_obj_set_style_text_font(weather_wind_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(weather_wind_label, lv_color_hex(0x9ca3af), 0);
     lv_obj_align(weather_wind_label, LV_ALIGN_BOTTOM_RIGHT, -5, -10);
