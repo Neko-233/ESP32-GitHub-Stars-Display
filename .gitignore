@@ -8,4 +8,4 @@
 /build/
 # 忽略私密配置文件
 secrets.h
-.vscode
+.vscode.DS_Store
