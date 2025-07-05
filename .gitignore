@@ -9,3 +9,4 @@
 # 忽略私密配置文件
 secrets.h
 .vscode.DS_Store
+.vscode/
