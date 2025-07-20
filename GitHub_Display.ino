@@ -199,6 +199,52 @@ bool isManualRefreshing = false;         // 是否正在手动刷新
 bool refreshButtonGreen = false;         // 刷新按钮是否为绿色状态
 bool waitingForRetry = false;            // 是否正在等待重试
 
+// WiFi设置状态机相关变量
+enum WiFiSetupState {
+  WIFI_SETUP_IDLE,
+  WIFI_SETUP_MODE_CHANGE,
+  WIFI_SETUP_SCAN_START,
+  WIFI_SETUP_SCAN_RETRY,
+  WIFI_SETUP_RESET_DISCONNECT,
+  WIFI_SETUP_RESET_OFF,
+  WIFI_SETUP_RESET_ON,
+  WIFI_SETUP_RESET_RECONNECT,
+  WIFI_SETUP_RESET_SCAN
+};
+
+// WiFi连接状态机相关变量
+enum WiFiConnectionState {
+  WIFI_CONN_IDLE,
+  WIFI_CONN_DISCONNECT,
+  WIFI_CONN_MODE_SET,
+  WIFI_CONN_CONNECTING,
+  WIFI_CONN_WAIT_RESULT,
+  WIFI_CONN_SUCCESS,
+  WIFI_CONN_FAILED
+};
+
+WiFiSetupState wifi_setup_state = WIFI_SETUP_IDLE;
+WiFiConnectionState wifi_connection_state = WIFI_CONN_IDLE;
+unsigned long wifi_setup_timer = 0;
+unsigned long wifi_connection_timer = 0;
+int wifi_setup_retry_count = 0;
+int wifi_scan_timeout_count = 0;           // WiFi扫描超时计数器
+int wifi_reset_attempt_count = 0;          // WiFi模块重置尝试计数器
+unsigned long wifi_scan_start_time = 0;    // WiFi扫描开始时间
+bool wifi_scan_in_progress = false;        // WiFi扫描进行中标志
+unsigned long wifi_scan_success_time = 0;  // WiFi扫描成功时间，用于避免scanDelete()的虚假失败事件
+bool wifi_scan_completed_once = false;      // WiFi扫描是否已成功完成过一次
+int wifi_connection_attempts = 0;
+String wifi_setup_saved_ssid = "";
+String wifi_setup_saved_password = "";
+bool wifi_setup_was_connected = false;
+int wifi_setup_reconnect_attempts = 0;
+bool wifi_connection_in_progress = false;
+bool wifi_connect_success_pending = false;
+bool wifi_connect_from_password_screen = false;
+const int MAX_WIFI_CONNECTION_ATTEMPTS = 30;
+const unsigned long WIFI_CONNECTION_TIMEOUT = 500;
+
 // 数字动画相关变量
 int animatingStars = -1;                 // 正在动画的星标数值
 int animatingForks = -1;                 // 正在动画的分支数值
@@ -292,6 +338,13 @@ const char* DEFAULT_LOCATION = "110101";  // 默认位置ID（北京东城区）
 String userLocation = DEFAULT_LOCATION;  // 用户设置的位置ID
 
 // ===== 函数前置声明 =====
+// WiFi设置状态机函数
+void processWiFiSetupStateMachine();                          // 处理WiFi设置状态机
+void printWiFiScanStatistics();                               // 打印WiFi扫描统计信息
+void startWiFiSetupProcess();                                 // 启动WiFi设置流程
+void processWiFiConnectionStateMachine();                     // 处理WiFi连接状态机
+bool startWiFiConnection(const char* target_ssid, const char* target_password); // 启动非阻塞WiFi连接
+
 // UI创建函数
 void createUI();                                              // 创建主界面UI
 void create_settings_screen();                                // 创建设置主菜单界面
@@ -375,19 +428,27 @@ void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
  *   - data: 触摸数据输出结构体
  */
 void my_touchpad_read(lv_indev_t *indev_driver, lv_indev_data_t *data) {
-    // 检查触摸中断引脚和触摸状态
-    if (touchscreen.tirqTouched() && touchscreen.touched()) {
+    // 直接检测触摸状态
+    bool is_touched = touchscreen.touched();
+    
+    if (is_touched) {
         TS_Point p = touchscreen.getPoint();  // 获取原始触摸坐标
         
-        // 坐标映射：将XPT2046的原始坐标转换为屏幕坐标
-        // 针对ESP32-2432S028R的触摸校准参数
-        int mapped_x = map(p.x, 200, 3700, SCREEN_WIDTH - 1, 0);   // X轴映射
-        int mapped_y = map(p.y, 240, 3800, SCREEN_HEIGHT - 1, 0);  // Y轴映射
+        // 检查坐标是否有效（避免无效的触摸数据）
+        if (p.x > 100 && p.x < 4000 && p.y > 100 && p.y < 4000 && p.z > 200) {
+            // 坐标映射：将XPT2046的原始坐标转换为屏幕坐标
+            // 针对ESP32-2432S028R的触摸校准参数
+            int mapped_x = map(p.x, 200, 3700, SCREEN_WIDTH - 1, 0);   // X轴映射
+            int mapped_y = map(p.y, 240, 3800, SCREEN_HEIGHT - 1, 0);  // Y轴映射
 
-        // 坐标约束：确保坐标值在屏幕范围内，防止越界
-        data->point.x = constrain(mapped_x, 0, SCREEN_WIDTH - 1);
-        data->point.y = constrain(mapped_y, 0, SCREEN_HEIGHT - 1);
-        data->state = LV_INDEV_STATE_PR;  // 设置触摸状态为按下
+            // 坐标约束：确保坐标值在屏幕范围内，防止越界
+            data->point.x = constrain(mapped_x, 0, SCREEN_WIDTH - 1);
+            data->point.y = constrain(mapped_y, 0, SCREEN_HEIGHT - 1);
+            data->state = LV_INDEV_STATE_PR;  // 设置触摸状态为按下
+        } else {
+            // 无效的触摸数据，忽略
+            data->state = LV_INDEV_STATE_REL;
+        }
     } else {
         data->state = LV_INDEV_STATE_REL;  // 设置触摸状态为释放（未触摸）
     }
@@ -586,108 +647,14 @@ static void settings_list_event_cb(lv_event_t * e) {
             lv_scr_load_anim(screen_wifi_list, LV_SCR_LOAD_ANIM_MOVE_BOTTOM, 100, 0, false);  // 使用向下滑动画切换到WiFi列表屏幕
             control_buttons_visibility(screen_wifi_list);  // 更新按钮显示状态
             lv_obj_t* list = lv_obj_get_child(screen_wifi_list, 1);  // 获取WiFi列表对象
+            cleanupWiFiListMemory(list);  // 清理分配的内存
             lv_obj_clean(list);  // 清空列表内容
             lv_obj_t* label = lv_obj_get_child(screen_wifi_list, 2);  // 获取状态标签
             lv_label_set_text(label, "Scanning for WiFi...");  // 显示扫描状态
             lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);  // 确保状态标签可见
             
-            // WiFi扫描流程开始
-            Serial.println("开始WiFi扫描...");  // 调试输出
-            Serial.printf("WiFi模式: %d\n", WiFi.getMode());  // 输出当前WiFi模式
-            Serial.printf("WiFi状态: %d\n", WiFi.status());  // 输出当前WiFi状态
-            
-            // 保存当前WiFi连接信息
-            currentSSID = WiFi.SSID();
-            currentPassword = "";
-            wasConnected = (WiFi.status() == WL_CONNECTED);
-            
-            // 如果当前已连接，保存密码信息（从preferences读取）
-            if (wasConnected) {
-                preferences.begin("wifi", true);
-                currentPassword = preferences.getString("password", "");
-                preferences.end();
-                Serial.printf("保存当前WiFi信息: %s\n", currentSSID.c_str());
-            }
-            
-            // 确保WiFi处于Station模式，但不断开当前连接
-            if (WiFi.getMode() != WIFI_STA && WiFi.getMode() != WIFI_AP_STA) {
-                WiFi.mode(WIFI_STA);  // 设置为Station模式
-                delay(100);  // 等待模式切换完成
-            }
-            
-            Serial.println("开始WiFi扫描（保持当前连接）...");
-            int scan_result = WiFi.scanNetworks(true);  // 启动异步WiFi网络扫描（不断开当前连接）
-            Serial.printf("扫描启动结果: %d\n", scan_result);
-            
-            // 处理扫描失败的情况
-            if (scan_result == -2) {  // -2表示扫描失败
-                 Serial.println("扫描失败，等待后重试...");
-                 delay(1000);  // 等待1秒后重试
-                 scan_result = WiFi.scanNetworks(true);  // 重试扫描（不断开连接）
-                 Serial.printf("重试扫描结果: %d\n", scan_result);
-                 
-                 // 如果重试仍然失败，执行强制WiFi模块重置
-                 if (scan_result == -2) {
-                     Serial.println("WiFi扫描仍然失败，开始强制重置WiFi模块...");
-                     
-                     // 保存当前连接状态
-                     bool was_connected = (WiFi.status() == WL_CONNECTED);
-                     String current_ssid = "";
-                     if (was_connected) {
-                         current_ssid = WiFi.SSID();
-                         Serial.printf("保存当前连接: %s\n", current_ssid.c_str());
-                     }
-                     
-                     // 完全重置WiFi模块
-                     Serial.println("步骤1: 断开所有WiFi连接...");
-                     WiFi.disconnect(true);  // 完全断开并清除配置
-                     delay(500);
-                     
-                     Serial.println("步骤2: 关闭WiFi模块...");
-                     WiFi.mode(WIFI_OFF);    // 关闭WiFi
-                     delay(1000);
-                     
-                     Serial.println("步骤3: 重新启用WiFi Station模式...");
-                     WiFi.mode(WIFI_STA);    // 重新启用Station模式
-                     delay(1000);
-                     
-                     // 如果之前有连接，尝试恢复连接
-                     if (was_connected && current_ssid.length() > 0) {
-                         Serial.printf("步骤4: 尝试恢复连接到 %s...\n", current_ssid.c_str());
-                         WiFi.begin(current_ssid, currentPassword);  // 使用保存的凭据重新连接
-                         
-                         // 等待连接恢复（最多10秒）
-                         int reconnect_attempts = 0;
-                         while (WiFi.status() != WL_CONNECTED && reconnect_attempts < 20) {
-                             delay(500);
-                             reconnect_attempts++;
-                             Serial.print(".");
-                         }
-                         
-                         if (WiFi.status() == WL_CONNECTED) {
-                             Serial.println("\nWiFi连接已恢复");
-                         } else {
-                             Serial.println("\nWiFi连接恢复失败");
-                         }
-                     }
-                     
-                     Serial.println("步骤5: 重置后重新尝试扫描...");
-                     delay(500);
-                     scan_result = WiFi.scanNetworks(true);  // 重置后重新扫描
-                     Serial.printf("重置后扫描结果: %d\n", scan_result);
-                     
-                     // 最终检查扫描结果
-                     if (scan_result == -2) {
-                         Serial.println("WiFi模块重置后扫描仍然失败，可能存在硬件问题");
-                         lv_obj_t* label = lv_obj_get_child(screen_wifi_list, 2);  // 获取状态标签
-                         lv_label_set_text(label, "WiFi module reset failed.\nPlease restart device.");  // 显示错误信息
-                     } else {
-                         Serial.println("WiFi模块重置成功，扫描功能已恢复");
-                         lv_obj_t* label = lv_obj_get_child(screen_wifi_list, 2);  // 获取状态标签
-                         lv_label_set_text(label, "WiFi module reset. Scanning...");  // 显示重置成功信息
-                     }
-                 }
-             }
+            // 启动非阻塞WiFi设置流程
+            startWiFiSetupProcess();
         } else if (strstr(txt, "GitHub Setup") != NULL) {  // 如果点击的是GitHub设置按钮
             lv_scr_load_anim(screen_github_settings, LV_SCR_LOAD_ANIM_MOVE_BOTTOM, 100, 0, false);  // 使用向下滑动画切换到GitHub设置屏幕
             control_buttons_visibility(screen_github_settings);  // 更新按钮显示状态
@@ -696,6 +663,307 @@ static void settings_list_event_cb(lv_event_t * e) {
             control_buttons_visibility(main_screen);  // 更新按钮显示状态
         }
     }
+}
+
+/**
+ * 启动WiFi设置流程
+ * 功能：初始化WiFi设置状态机，开始非阻塞的WiFi扫描流程
+ */
+void startWiFiSetupProcess() {
+    Serial.println("=== 启动非阻塞WiFi设置流程 ===");
+    
+    // 重置扫描完成标志，允许重新扫描
+    wifi_scan_completed_once = false;
+    Serial.println("[WIFI] 重置扫描完成标志，允许重新扫描");
+    
+    // 保存当前WiFi连接信息
+    wifi_setup_saved_ssid = WiFi.SSID();
+    wifi_setup_saved_password = "";
+    wifi_setup_was_connected = (WiFi.status() == WL_CONNECTED);
+    wifi_setup_retry_count = 0;
+    wifi_scan_timeout_count = 0;
+    wifi_reset_attempt_count = 0;
+    wifi_scan_in_progress = false;
+    wifi_scan_start_time = 0;
+    wifi_setup_reconnect_attempts = 0;
+    
+    // 如果当前已连接，保存密码信息（从preferences读取）
+    if (wifi_setup_was_connected) {
+        preferences.begin("wifi", true);
+        wifi_setup_saved_password = preferences.getString("password", "");
+        preferences.end();
+        Serial.printf("保存当前WiFi信息: %s\n", wifi_setup_saved_ssid.c_str());
+    }
+    
+    // 检查WiFi模式，如果需要则启动模式切换
+    if (WiFi.getMode() != WIFI_STA && WiFi.getMode() != WIFI_AP_STA) {
+        Serial.println("需要切换WiFi模式到Station模式");
+        WiFi.mode(WIFI_STA);
+        wifi_setup_state = WIFI_SETUP_MODE_CHANGE;
+        wifi_setup_timer = millis();
+    } else {
+        // 直接开始扫描
+        wifi_setup_state = WIFI_SETUP_SCAN_START;
+        wifi_setup_timer = millis();
+    }
+}
+
+/**
+ * 处理WiFi设置状态机
+ * 功能：非阻塞地处理WiFi扫描和重置流程
+ */
+/**
+ * WiFi设置状态机处理函数（优化版）
+ * 功能：处理WiFi设置相关的状态机，确保非阻塞运行
+ * 优化：移除所有阻塞操作，确保不影响LVGL触摸事件处理
+ */
+void processWiFiSetupStateMachine() {
+    static WiFiSetupState lastLoggedState = WIFI_SETUP_IDLE;
+    static unsigned long lastStateLogTime = 0;
+    
+    // 记录状态变化
+    if (wifi_setup_state != lastLoggedState) {
+        Serial.printf("[WIFI_SM] 状态变化: %d -> %d, 时间: %lu\n", 
+                     lastLoggedState, wifi_setup_state, millis());
+        lastLoggedState = wifi_setup_state;
+        lastStateLogTime = millis();
+    }
+    
+    // 定期输出当前状态（每15秒，减少日志频率）
+    if (millis() - lastStateLogTime > 15000) {
+        Serial.printf("[WIFI_SM] 当前状态: %d, 运行时间: %lu\n", wifi_setup_state, millis());
+        lastStateLogTime = millis();
+    }
+    
+    unsigned long currentTime = millis();
+    
+    if (wifi_setup_state == WIFI_SETUP_IDLE) {
+        // 在空闲状态下检查扫描超时
+        if (wifi_scan_in_progress && (currentTime - wifi_scan_start_time > 30000)) {
+            Serial.println("[WIFI_SM] WiFi扫描超时（30秒），强制重试");
+            wifi_scan_in_progress = false;
+            wifi_scan_timeout_count++;
+            wifi_setup_state = WIFI_SETUP_SCAN_RETRY;
+            wifi_setup_timer = currentTime;
+            return;
+        }
+        return;  // 空闲状态，无需处理
+    }
+    
+    switch (wifi_setup_state) {
+        case WIFI_SETUP_MODE_CHANGE:
+            // 等待WiFi模式切换完成（减少等待时间）
+            if (currentTime - wifi_setup_timer >= 50) {
+                Serial.println("[WIFI_SM] WiFi模式切换完成，开始扫描");
+                wifi_setup_state = WIFI_SETUP_SCAN_START;
+                wifi_setup_timer = currentTime;
+            }
+            break;
+            
+        case WIFI_SETUP_SCAN_START:
+            {
+                // 检查是否已经扫描成功过一次，如果是则跳过扫描
+                if (wifi_scan_completed_once) {
+                    Serial.println("[WIFI_SM] 已有扫描结果，跳过重复扫描");
+                    wifi_setup_state = WIFI_SETUP_IDLE;
+                    wifi_scan_in_progress = false;
+                    break;
+                }
+                
+                // 启动WiFi扫描（异步，非阻塞）
+                Serial.printf("[WIFI_SM] 开始WiFi扫描（第%d次尝试）...\n", wifi_setup_retry_count + 1);
+                
+                // 清理之前的扫描结果
+                WiFi.scanDelete();
+                delay(50);
+                
+                int scan_result = WiFi.scanNetworks(true);  // 启动异步扫描
+                Serial.printf("[WIFI_SM] 扫描启动结果: %d\n", scan_result);
+                
+                if (scan_result == -2) {  // 扫描失败
+                    Serial.println("[WIFI_SM] 扫描启动失败，准备重试...");
+                    wifi_setup_state = WIFI_SETUP_SCAN_RETRY;
+                    wifi_setup_timer = currentTime;
+                } else {
+                    // 扫描启动成功，记录开始时间并回到空闲状态等待扫描完成
+                    wifi_scan_start_time = currentTime;
+                    wifi_scan_in_progress = true;
+                    wifi_setup_state = WIFI_SETUP_IDLE;
+                    Serial.println("[WIFI_SM] WiFi扫描已启动，等待完成...");
+                }
+                break;
+            }
+            
+        case WIFI_SETUP_SCAN_RETRY:
+            {
+                // 检查是否已经扫描成功过一次，如果是则跳过扫描
+                if (wifi_scan_completed_once) {
+                    Serial.println("[WIFI_SM] 重试时检测到已有扫描结果，跳过重复扫描");
+                    wifi_setup_state = WIFI_SETUP_IDLE;
+                    break;
+                }
+                
+                // 使用渐进式延迟重试策略
+                unsigned long retry_delay = 500 + (wifi_setup_retry_count * 300);  // 500ms, 800ms, 1100ms...
+                
+                if (currentTime - wifi_setup_timer >= retry_delay) {
+                    wifi_setup_retry_count++;
+                    Serial.printf("[WIFI_SM] 重试扫描 (第%d次，延迟%lums)...\n", wifi_setup_retry_count, retry_delay);
+                    
+                    // 清理之前的扫描结果
+                    WiFi.scanDelete();
+                    delay(100);
+                    
+                    int retry_result = WiFi.scanNetworks(true);
+                    Serial.printf("[WIFI_SM] 重试扫描结果: %d\n", retry_result);
+                    
+                    if (retry_result == -2) {
+                        if (wifi_setup_retry_count < 5) {
+                            // 继续重试（最多5次）
+                            wifi_setup_timer = currentTime;
+                            Serial.printf("[WIFI_SM] 扫描失败，将在%lums后进行第%d次重试\n", retry_delay + 300, wifi_setup_retry_count + 1);
+                        } else if (wifi_reset_attempt_count < 2) {
+                            // 尝试WiFi模块软重置
+                            Serial.println("[WIFI_SM] 多次扫描失败，尝试WiFi模块软重置...");
+                            wifi_reset_attempt_count++;
+                            wifi_setup_retry_count = 0;  // 重置重试计数
+                            wifi_setup_state = WIFI_SETUP_RESET_DISCONNECT;
+                            wifi_setup_timer = currentTime;
+                        } else {
+                            // 所有重试和重置都失败，进入最终错误状态
+                            Serial.println("[WIFI_SM] WiFi扫描彻底失败，进入错误恢复模式");
+                            wifi_setup_state = WIFI_SETUP_IDLE;
+                            wifi_scan_timeout_count++;
+                            // 重置所有计数器，为下次尝试做准备
+                            wifi_setup_retry_count = 0;
+                            wifi_reset_attempt_count = 0;
+                        }
+                    } else {
+                        // 重试成功，重置所有计数器
+                        Serial.println("[WIFI_SM] WiFi扫描重试成功！");
+                        wifi_setup_retry_count = 0;
+                        wifi_reset_attempt_count = 0;
+                        wifi_scan_start_time = currentTime;
+                        wifi_scan_in_progress = true;
+                        wifi_setup_state = WIFI_SETUP_IDLE;
+                    }
+                }
+                break;
+            }
+            
+        case WIFI_SETUP_RESET_DISCONNECT:
+            // 增强的重置流程：断开连接并清理
+            Serial.println("[WIFI_SM] 执行WiFi软重置: 断开连接并清理...");
+            WiFi.disconnect(true);   // 断开并清除配置
+            WiFi.scanDelete();       // 清除扫描结果
+            delay(200);              // 等待断开完成
+            wifi_setup_state = WIFI_SETUP_RESET_OFF;
+            wifi_setup_timer = currentTime;
+            break;
+            
+        case WIFI_SETUP_RESET_OFF:
+            // WiFi模块关闭
+            if (currentTime - wifi_setup_timer >= 300) {
+                Serial.println("[WIFI_SM] 关闭WiFi模块...");
+                WiFi.mode(WIFI_OFF);
+                delay(100);
+                wifi_setup_state = WIFI_SETUP_RESET_ON;
+                wifi_setup_timer = currentTime;
+            }
+            break;
+            
+        case WIFI_SETUP_RESET_ON:
+            // WiFi模块重新启动
+            if (currentTime - wifi_setup_timer >= 500) {
+                Serial.println("[WIFI_SM] 重新启动WiFi模块...");
+                WiFi.mode(WIFI_STA);
+                delay(200);
+                // 如果之前有连接，尝试重新连接
+                if (wifi_setup_was_connected && wifi_setup_saved_ssid.length() > 0) {
+                    Serial.printf("[WIFI_SM] 重新连接到 %s...\n", wifi_setup_saved_ssid.c_str());
+                    WiFi.begin(wifi_setup_saved_ssid, wifi_setup_saved_password);
+                    delay(100);
+                }
+                wifi_setup_state = WIFI_SETUP_RESET_SCAN;
+                wifi_setup_timer = currentTime;
+            }
+            break;
+            
+        case WIFI_SETUP_RESET_RECONNECT:
+            // 简化的重连流程
+            if (wifi_setup_was_connected && wifi_setup_saved_ssid.length() > 0) {
+                Serial.printf("[WIFI_SM] 尝试快速重连到 %s...\n", wifi_setup_saved_ssid.c_str());
+                WiFi.begin(wifi_setup_saved_ssid, wifi_setup_saved_password);
+            }
+            wifi_setup_state = WIFI_SETUP_IDLE;  // 立即回到空闲状态
+            break;
+            
+        case WIFI_SETUP_RESET_SCAN:
+            {
+                // 重置后的扫描重试
+                if (currentTime - wifi_setup_timer >= 1000) {
+                    // 检查是否已经扫描成功过一次，如果是则跳过扫描
+                    if (wifi_scan_completed_once) {
+                        Serial.println("[WIFI_SM] 重置后检测到已有扫描结果，跳过重复扫描");
+                        wifi_setup_state = WIFI_SETUP_IDLE;
+                        break;
+                    }
+                    
+                    Serial.println("[WIFI_SM] WiFi模块重置完成，重新尝试扫描...");
+                    WiFi.scanDelete();  // 清理之前的结果
+                    delay(100);
+                    
+                    int final_scan_result = WiFi.scanNetworks(true);
+                    Serial.printf("[WIFI_SM] 重置后扫描结果: %d\n", final_scan_result);
+                    
+                    if (final_scan_result == -2) {
+                        Serial.println("[WIFI_SM] 重置后扫描仍然失败，回到重试流程");
+                        wifi_setup_state = WIFI_SETUP_SCAN_RETRY;
+                        wifi_setup_timer = currentTime;
+                    } else {
+                        Serial.println("[WIFI_SM] 重置后扫描成功！");
+                        wifi_scan_start_time = currentTime;
+                        wifi_scan_in_progress = true;
+                        wifi_setup_state = WIFI_SETUP_IDLE;
+                    }
+                }
+                break;
+            }
+            
+        default:
+            wifi_setup_state = WIFI_SETUP_IDLE;
+            break;
+    }
+}
+
+/**
+ * 打印WiFi扫描统计信息
+ * 功能：显示WiFi扫描的健康状况和统计数据
+ */
+void printWiFiScanStatistics() {
+    Serial.println("=== WiFi扫描统计信息 ===");
+    Serial.printf("总超时次数: %d\n", wifi_scan_timeout_count);
+    Serial.printf("当前重试次数: %d\n", wifi_setup_retry_count);
+    Serial.printf("模块重置次数: %d\n", wifi_reset_attempt_count);
+    Serial.printf("扫描进行中: %s\n", wifi_scan_in_progress ? "是" : "否");
+    
+    if (wifi_scan_in_progress && wifi_scan_start_time > 0) {
+        unsigned long scan_duration = millis() - wifi_scan_start_time;
+        Serial.printf("当前扫描已用时: %lu秒\n", scan_duration / 1000);
+    }
+    
+    // 评估WiFi模块健康状况
+    if (wifi_scan_timeout_count == 0 && wifi_reset_attempt_count == 0) {
+        Serial.println("WiFi模块状态: 健康");
+    } else if (wifi_scan_timeout_count < 3 && wifi_reset_attempt_count < 2) {
+        Serial.println("WiFi模块状态: 良好");
+    } else if (wifi_scan_timeout_count < 6) {
+        Serial.println("WiFi模块状态: 需要关注");
+    } else {
+        Serial.println("WiFi模块状态: 可能存在问题");
+    }
+    
+    Serial.println("========================");
 }
 
 /**
@@ -863,6 +1131,32 @@ void create_chart_screen() {
 }
 
 /**
+ * 清理WiFi列表中分配的内存
+ * 功能：释放为WiFi网络名称分配的内存，防止内存泄漏
+ * 参数：list - WiFi列表对象
+ */
+void cleanupWiFiListMemory(lv_obj_t* list) {
+    if (list == NULL) return;
+    
+    uint32_t child_count = lv_obj_get_child_cnt(list);
+    Serial.printf("[MEMORY] 清理WiFi列表内存，共%d个子对象\n", child_count);
+    
+    for (uint32_t i = 0; i < child_count; i++) {
+        lv_obj_t* child = lv_obj_get_child(list, i);
+        if (child != NULL) {
+            // 获取存储在用户数据中的字符串指针
+            char* ssid_copy = (char*)lv_obj_get_user_data(child);
+            if (ssid_copy != NULL) {
+                Serial.printf("[MEMORY] 释放SSID内存: %s\n", ssid_copy);
+                free(ssid_copy);
+                lv_obj_set_user_data(child, NULL);
+            }
+        }
+    }
+    Serial.println("[MEMORY] WiFi列表内存清理完成");
+}
+
+/**
  * WiFi列表项点击事件处理函数
  * 功能：处理用户点击WiFi网络列表中某个网络的事件
  * 参数：e - LVGL事件对象
@@ -899,86 +1193,25 @@ static void wifi_connect_event_cb(lv_event_t * e) {
     Serial.print("选择的SSID: "); Serial.println(selected_ssid);
     Serial.print("输入的密码长度: "); Serial.println(strlen(pwd));
     
-    // 保存WiFi凭据到全局变量
-    strncpy(ssid, selected_ssid, sizeof(ssid) - 1);  // 复制SSID
-    ssid[sizeof(ssid) - 1] = '\0';  // 确保字符串结束
-    strncpy(password, pwd, sizeof(password) - 1);  // 复制密码
-    password[sizeof(password) - 1] = '\0';  // 确保字符串结束
-    
     // 显示连接中的消息框
     show_message_box("Connecting...", "Attempting to connect to WiFi.");
     lv_timer_handler();  // 处理LVGL事件，确保消息框显示
 
-    // WiFi连接流程
-    Serial.println("断开现有WiFi连接...");
-    WiFi.disconnect();  // 断开当前连接
-    delay(100);  // 等待断开完成
-    
-    Serial.println("开始新的WiFi连接...");
-    WiFi.begin(ssid, password);  // 开始连接到指定的WiFi网络
-    int attempts = 0;  // 连接尝试计数器
-    
-    // 等待连接完成，最多尝试30次（15秒）
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-        delay(500);  // 每次等待500ms
-        attempts++;  // 增加尝试次数
-        Serial.print("连接尝试 "); Serial.print(attempts); Serial.print("/30, 状态: ");
+    // 启动非阻塞WiFi连接
+    if (startWiFiConnection(selected_ssid, pwd)) {
+        Serial.println("WiFi连接流程已启动（非阻塞模式）");
         
-        // 输出详细的连接状态信息，便于调试
-        switch(WiFi.status()) {
-            case WL_IDLE_STATUS: Serial.println("空闲"); break;  // WiFi模块空闲状态
-            case WL_NO_SSID_AVAIL: Serial.println("找不到SSID"); break;  // 指定的SSID不存在
-            case WL_SCAN_COMPLETED: Serial.println("扫描完成"); break;  // 网络扫描完成
-            case WL_CONNECTED: Serial.println("已连接"); break;  // 成功连接到WiFi
-            case WL_CONNECT_FAILED: Serial.println("连接失败"); break;  // 连接失败（通常是密码错误）
-            case WL_CONNECTION_LOST: Serial.println("连接丢失"); break;  // 连接中断
-            case WL_DISCONNECTED: Serial.println("已断开"); break;  // 已断开连接
-            default: Serial.print("状态码: "); Serial.println(WiFi.status()); break;  // 其他未知状态
-        }
+        // 保存WiFi凭据到全局变量（在startWiFiConnection中已完成）
+        // 保存WiFi配置
+        save_settings();
         
-        // 检查是否出现明确的错误状态，如果是则提前退出循环
-        if (WiFi.status() == WL_NO_SSID_AVAIL || WiFi.status() == WL_CONNECT_FAILED) {
-            Serial.println("检测到连接错误，提前退出");
-            break;  // 跳出等待循环
-        }
-    }
-
-    // 处理WiFi连接结果
-    if (WiFi.status() == WL_CONNECTED) {
-        // 连接成功的处理流程
-        Serial.println("=== WiFi连接成功! ===");
-        Serial.print("IP地址: "); Serial.println(WiFi.localIP());  // 输出获得的IP地址
-        
-        // 显示成功消息并保存设置
-        show_message_box("Success", "WiFi connected successfully!\nSettings saved.");
-        save_settings();  // 保存WiFi凭据到EEPROM
-        updateStatus("WiFi Connected", lv_color_hex(0x10b981));  // 更新状态为绿色"已连接"
-        fetchGitHubData();  // 立即获取GitHub数据
+        // 设置连接成功回调标志
+        wifi_connect_success_pending = true;
+        wifi_connect_from_password_screen = true;  // 标记来自密码输入界面
     } else {
-        // 连接失败的处理流程
-        Serial.println("=== WiFi连接失败! ===");
-        Serial.print("最终状态: ");
-        // 根据具体的失败原因显示不同的错误消息
-        switch(WiFi.status()) {
-            case WL_NO_SSID_AVAIL:
-                Serial.println("找不到指定的SSID");
-                show_message_box("Failure", "Network not found.\nPlease check SSID.");  // SSID不存在
-                break;
-            case WL_CONNECT_FAILED:
-                Serial.println("连接失败，可能是密码错误");
-                show_message_box("Failure", "Wrong password.\nPlease try again.");  // 密码错误
-                break;
-            default:
-                Serial.print("其他错误，状态码: "); Serial.println(WiFi.status());
-                show_message_box("Failure", "WiFi connection failed.\nPlease check settings.");  // 其他未知错误
-                break;
-        }
-        updateStatus("WiFi Connection Failed!", lv_color_hex(0xef4444));  // 更新状态为红色"连接失败"
+        Serial.println("WiFi连接已在进行中，请等待当前连接完成");
+        show_message_box("Info", "WiFi connection in progress...\nPlease wait.");
     }
-    
-    // 连接完成后返回设置界面
-    lv_scr_load_anim(screen_settings, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 100, 0, false);  // 使用右滑动画切换到设置屏幕
-    control_buttons_visibility(screen_settings);  // 更新按钮显示状态
 }
 
 /**
@@ -1058,13 +1291,33 @@ void fetchWeatherData() {
     Serial.println("开始发送HTTPS请求...");
     
     http.begin(client, url);
-    http.setTimeout(15000); // 15秒超时
+    http.setTimeout(5000); // 5秒超时
     http.addHeader("User-Agent", "ESP32-WeatherDisplay/1.0");
     http.addHeader("Accept", "application/json");
     http.addHeader("Accept-Encoding", "identity"); // 要求未压缩响应，避免解压缩复杂性
     http.addHeader("Connection", "close");
     
+    // 发送HTTP GET请求（这个操作本身是阻塞的，但通常很快完成）
     int httpResponseCode = http.GET();
+    
+    // 如果请求正在进行中，等待响应但保持UI响应
+    if (httpResponseCode == 200 || httpResponseCode > 0) {
+        // 请求成功，继续处理
+        Serial.println("天气API请求立即成功");
+    } else {
+        // 请求可能需要时间，在短时间内保持UI响应
+        Serial.println("天气API请求需要等待响应...");
+        unsigned long requestStart = millis();
+        while (httpResponseCode <= 0 && (millis() - requestStart) < 5000) {
+            lv_timer_handler();  // 保持触摸响应
+            lv_tick_inc(1);
+            delay(5);  // 减少延时
+            // 检查连接状态，避免重复GET请求
+            if (httpResponseCode <= 0) {
+                break;  // 如果仍然没有响应，退出循环
+            }
+        }
+    }
     
     if (httpResponseCode == 200) {
         // 直接获取未压缩的响应数据
@@ -2274,6 +2527,50 @@ void create_wifi_list_screen() {
     lv_obj_set_style_text_color(label, lv_color_hex(0x94a3b8), 0);  // 灰色文字
     lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);  // 设置字体
     lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);  // 居中显示
+    
+    // 添加点击事件处理，支持重试扫描
+    lv_obj_add_event_cb(label, [](lv_event_t * e) {
+        lv_event_code_t code = lv_event_get_code(e);
+        if (code == LV_EVENT_CLICKED) {
+            lv_obj_t* label = (lv_obj_t*)lv_event_get_target(e);
+            const char* text = lv_label_get_text(label);
+            
+            // 检查是否是扫描失败状态
+            if (strstr(text, "Scan failed") != NULL || strstr(text, "Tap to retry") != NULL) {
+                Serial.println("[WIFI_RETRY] 用户点击重试扫描");
+                
+                // 更新状态标签为扫描中
+                lv_label_set_text(label, LV_SYMBOL_REFRESH " Scanning for networks...");
+                lv_obj_set_style_text_color(label, lv_color_hex(0x94a3b8), 0);
+                
+                // 清空WiFi列表
+                lv_obj_t* list = lv_obj_get_child(screen_wifi_list, 1);
+                if (list) {
+                    cleanupWiFiListMemory(list);  // 清理分配的内存
+                    lv_obj_clean(list);
+                }
+                
+                // 打印当前WiFi扫描统计信息
+                printWiFiScanStatistics();
+                
+                // 重置WiFi状态机并启动新的扫描
+                wifi_setup_state = WIFI_SETUP_SCAN_START;
+                wifi_setup_retry_count = 0;
+                wifi_scan_completed_once = false;  // 重置扫描完成标志，允许重新扫描
+                wifi_scan_success_time = 0;  // 重置扫描成功时间戳，避免虚假失败事件检测问题
+                WiFi.scanDelete();
+                delay(100);
+                
+                Serial.println("[WIFI] 用户手动重试WiFi扫描，重置扫描完成标志和成功时间戳");
+                
+                int result = WiFi.scanNetworks(true);
+                Serial.printf("[WIFI_RETRY] 启动新扫描，结果: %d\n", result);
+            }
+        }
+    }, LV_EVENT_CLICKED, NULL);
+    
+    // 设置标签为可点击
+    lv_obj_add_flag(label, LV_OBJ_FLAG_CLICKABLE);
 
     // 创建现代化返回按钮
     lv_obj_t* back_btn = lv_btn_create(screen_wifi_list);  // 创建返回按钮
@@ -3054,13 +3351,18 @@ void create_weather_screen() {
     
     // 检查WiFi连接状态和时间同步
     if (WiFi.status() == WL_CONNECTED) {
-        time_valid = getLocalTime(&timeinfo);
+        time_valid = getLocalTime(&timeinfo, 10);  // 设置10ms超时，避免阻塞
         if (!time_valid) {
             // 如果NTP时间获取失败，尝试重新配置时间
             Serial.println("天气界面：NTP时间获取失败，尝试重新同步");
             configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-            delay(1000);
-            time_valid = getLocalTime(&timeinfo);
+            // 非阻塞等待时间同步
+            unsigned long weatherNtpWaitTime = millis();
+            while (millis() - weatherNtpWaitTime < 1000) {
+                lv_timer_handler();  // 保持UI响应
+                lv_tick_inc(1);
+            }
+            time_valid = getLocalTime(&timeinfo, 10);  // 设置10ms超时，避免阻塞
         }
     }
     
@@ -3234,7 +3536,7 @@ void create_calendar_screen() {
     
     // 检查WiFi连接状态和时间同步
     if (WiFi.status() == WL_CONNECTED) {
-        time_valid = getLocalTime(&timeinfo);
+        time_valid = getLocalTime(&timeinfo, 10);  // 设置10ms超时，避免阻塞
         if (time_valid) {
             // 输出详细的时间调试信息
             const char* debug_weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
@@ -3247,8 +3549,13 @@ void create_calendar_screen() {
             // 如果NTP时间获取失败，尝试重新配置时间
             Serial.println("日历界面：NTP时间获取失败，尝试重新同步");
             configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-            delay(1000);
-            time_valid = getLocalTime(&timeinfo);
+            // 非阻塞等待时间同步
+            unsigned long calendarNtpWaitTime = millis();
+            while (millis() - calendarNtpWaitTime < 1000) {
+                lv_timer_handler();  // 保持UI响应
+                lv_tick_inc(1);
+            }
+            time_valid = getLocalTime(&timeinfo, 10);  // 设置10ms超时，避免阻塞
             if (time_valid) {
                 const char* debug_weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
                 Serial.println("=== 重新同步后的时间信息 ===");
@@ -3504,98 +3811,200 @@ void save_settings() {
  * - 实时更新UI状态显示
  * - 连接成功后显示网络信息（IP、信号强度等）
  */
-bool connectWiFi() {
-    Serial.println("=== WiFi连接开始 ===");
-    updateStatus("Connecting to WiFi...", lv_color_hex(0xf59e0b));  // 更新UI状态
-    
-    Serial.print("目标SSID: "); Serial.println(ssid);
-    Serial.print("密码长度: "); Serial.println(strlen(password));
-    
-    // 断开现有连接，确保干净的连接状态
-    WiFi.disconnect();
-    delay(100);
-    
-    // 设置WiFi为Station模式（客户端模式）
-    Serial.println("设置WiFi模式为STA...");
-    WiFi.mode(WIFI_STA);
-    delay(100);
-    
-    // 开始连接到指定的WiFi网络
-    Serial.println("开始连接WiFi...");
-    WiFi.begin(ssid, password);
-    
-    // 连接重试循环（最多30次尝试，总计15秒）
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-        delay(500);  // 每次尝试间隔500ms
-        attempts++;
-        Serial.print("连接尝试 "); Serial.print(attempts); 
-        Serial.print("/30, 状态: ");
-        
-        // 详细的WiFi连接状态监控，便于问题诊断
-        switch(WiFi.status()) {
-            case WL_IDLE_STATUS:
-                Serial.println("空闲状态");  // WiFi模块空闲
-                break;
-            case WL_NO_SSID_AVAIL:
-                Serial.println("找不到SSID");  // 指定的网络名称不存在
-                break;
-            case WL_SCAN_COMPLETED:
-                Serial.println("扫描完成");  // 网络扫描已完成
-                break;
-            case WL_CONNECTED:
-                Serial.println("已连接");  // 连接成功
-                break;
-            case WL_CONNECT_FAILED:
-                Serial.println("连接失败");  // 连接失败（通常是密码错误）
-                break;
-            case WL_CONNECTION_LOST:
-                Serial.println("连接丢失");  // 连接中断
-                break;
-            case WL_DISCONNECTED:
-                Serial.println("已断开");  // 主动断开连接
-                break;
-            default:
-                Serial.print("未知状态: "); Serial.println(WiFi.status());
-                break;
-        }
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("=== WiFi连接成功! ===");
-        Serial.print("IP地址: "); Serial.println(WiFi.localIP());
-        Serial.print("信号强度: "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
-        Serial.print("网关: "); Serial.println(WiFi.gatewayIP());
-        Serial.print("DNS: "); Serial.println(WiFi.dnsIP());
-        
-        updateStatus("WiFi Connected", lv_color_hex(0x10b981));
-        delay(1000);
-        return true;
-    } else {
-        Serial.println("=== WiFi连接失败! ===");
-        Serial.print("最终状态: ");
-        switch(WiFi.status()) {
-            case WL_NO_SSID_AVAIL:
-                Serial.println("找不到指定的SSID，请检查网络名称");
-                break;
-            case WL_CONNECT_FAILED:
-                Serial.println("连接失败，可能是密码错误");
-                break;
-            case WL_CONNECTION_LOST:
-                Serial.println("连接丢失");
-                break;
-            case WL_DISCONNECTED:
-                Serial.println("连接被断开");
-                break;
-            default:
-                Serial.print("连接超时，状态码: "); Serial.println(WiFi.status());
-                break;
-        }
-        Serial.print("尝试次数: "); Serial.print(attempts); Serial.println("/30");
-        
-        updateStatus("WiFi Connection Failed", lv_color_hex(0xef4444));
+/**
+ * 启动非阻塞WiFi连接
+ * 功能：启动WiFi连接状态机，不阻塞主循环
+ * 参数：target_ssid - 目标SSID，target_password - 目标密码
+ * 返回：true表示连接流程已启动，false表示已有连接在进行中
+ */
+bool startWiFiConnection(const char* target_ssid, const char* target_password) {
+    if (wifi_connection_in_progress) {
+        Serial.println("WiFi连接已在进行中，跳过新的连接请求");
         return false;
     }
+    
+    Serial.println("=== 启动非阻塞WiFi连接 ===");
+    Serial.print("目标SSID: "); Serial.println(target_ssid);
+    Serial.print("密码长度: "); Serial.println(strlen(target_password));
+    
+    // 保存连接参数到全局变量
+    strncpy(ssid, target_ssid, sizeof(ssid) - 1);
+    ssid[sizeof(ssid) - 1] = '\0';
+    strncpy(password, target_password, sizeof(password) - 1);
+    password[sizeof(password) - 1] = '\0';
+    
+    // 初始化连接状态机
+    wifi_connection_state = WIFI_CONN_DISCONNECT;
+    wifi_connection_timer = millis();
+    wifi_connection_attempts = 0;
+    wifi_connection_in_progress = true;
+    
+    updateStatus("Connecting to WiFi...", lv_color_hex(0xf59e0b));
+    
+    return true;
+}
+
+/**
+ * WiFi连接状态机处理函数
+ * 功能：非阻塞地处理WiFi连接流程
+ */
+void processWiFiConnectionStateMachine() {
+    if (!wifi_connection_in_progress) {
+        return;  // 没有连接在进行中
+    }
+    
+    unsigned long currentTime = millis();
+    
+    switch (wifi_connection_state) {
+        case WIFI_CONN_IDLE:
+            // 空闲状态，无需处理
+            break;
+            
+        case WIFI_CONN_DISCONNECT:
+            // 断开现有连接
+            Serial.println("[WIFI_CONN] 断开现有连接...");
+            WiFi.disconnect();
+            wifi_connection_state = WIFI_CONN_MODE_SET;
+            wifi_connection_timer = currentTime;
+            break;
+            
+        case WIFI_CONN_MODE_SET:
+            // 等待断开完成，然后设置WiFi模式
+            if (currentTime - wifi_connection_timer >= 100) {
+                Serial.println("[WIFI_CONN] 设置WiFi模式为STA...");
+                WiFi.mode(WIFI_STA);
+                wifi_connection_state = WIFI_CONN_CONNECTING;
+                wifi_connection_timer = currentTime;
+            }
+            break;
+            
+        case WIFI_CONN_CONNECTING:
+            // 等待模式设置完成，然后开始连接
+            if (currentTime - wifi_connection_timer >= 100) {
+                Serial.println("[WIFI_CONN] 开始连接WiFi...");
+                WiFi.begin(ssid, password);
+                wifi_connection_state = WIFI_CONN_WAIT_RESULT;
+                wifi_connection_timer = currentTime;
+                wifi_connection_attempts = 0;
+            }
+            break;
+            
+        case WIFI_CONN_WAIT_RESULT:
+            // 等待连接结果
+            if (currentTime - wifi_connection_timer >= WIFI_CONNECTION_TIMEOUT) {
+                wifi_connection_attempts++;
+                
+                // 输出连接状态
+                Serial.printf("[WIFI_CONN] 连接尝试 %d/%d, 状态: ", 
+                             wifi_connection_attempts, MAX_WIFI_CONNECTION_ATTEMPTS);
+                
+                switch(WiFi.status()) {
+                    case WL_IDLE_STATUS:
+                        Serial.println("空闲状态");
+                        break;
+                    case WL_NO_SSID_AVAIL:
+                        Serial.println("找不到SSID");
+                        wifi_connection_state = WIFI_CONN_FAILED;
+                        break;
+                    case WL_SCAN_COMPLETED:
+                        Serial.println("扫描完成");
+                        break;
+                    case WL_CONNECTED:
+                        Serial.println("已连接");
+                        wifi_connection_state = WIFI_CONN_SUCCESS;
+                        break;
+                    case WL_CONNECT_FAILED:
+                        Serial.println("连接失败");
+                        wifi_connection_state = WIFI_CONN_FAILED;
+                        break;
+                    case WL_CONNECTION_LOST:
+                        Serial.println("连接丢失");
+                        break;
+                    case WL_DISCONNECTED:
+                        Serial.println("已断开");
+                        break;
+                    default:
+                        Serial.printf("未知状态: %d\n", WiFi.status());
+                        break;
+                }
+                
+                // 检查是否需要继续等待或超时
+                if (wifi_connection_state == WIFI_CONN_WAIT_RESULT) {
+                    if (wifi_connection_attempts >= MAX_WIFI_CONNECTION_ATTEMPTS) {
+                        Serial.println("[WIFI_CONN] 连接超时");
+                        wifi_connection_state = WIFI_CONN_FAILED;
+                    } else {
+                        // 继续等待
+                        wifi_connection_timer = currentTime;
+                    }
+                }
+            }
+            break;
+            
+        case WIFI_CONN_SUCCESS:
+            // 连接成功处理
+            Serial.println("=== WiFi连接成功! ===");
+            Serial.printf("IP地址: %s\n", WiFi.localIP().toString().c_str());
+            Serial.printf("信号强度: %d dBm\n", WiFi.RSSI());
+            Serial.printf("网关: %s\n", WiFi.gatewayIP().toString().c_str());
+            Serial.printf("DNS: %s\n", WiFi.dnsIP().toString().c_str());
+            
+            // 连接成功后清理扫描结果，释放内存
+            WiFi.scanDelete();
+            Serial.println("[WIFI] 连接成功，已清理扫描结果");
+            
+            updateStatus("WiFi Connected", lv_color_hex(0x10b981));
+            wifi_connection_in_progress = false;
+            wifi_connection_state = WIFI_CONN_IDLE;
+            break;
+            
+        case WIFI_CONN_FAILED:
+            // 连接失败处理
+            Serial.println("=== WiFi连接失败! ===");
+            Serial.printf("最终状态: ");
+            switch(WiFi.status()) {
+                case WL_NO_SSID_AVAIL:
+                    Serial.println("找不到指定的SSID，请检查网络名称");
+                    break;
+                case WL_CONNECT_FAILED:
+                    Serial.println("连接失败，可能是密码错误");
+                    break;
+                case WL_CONNECTION_LOST:
+                    Serial.println("连接丢失");
+                    break;
+                case WL_DISCONNECTED:
+                    Serial.println("连接被断开");
+                    break;
+                default:
+                    Serial.printf("连接超时，状态码: %d\n", WiFi.status());
+                    break;
+            }
+            Serial.printf("尝试次数: %d/%d\n", wifi_connection_attempts, MAX_WIFI_CONNECTION_ATTEMPTS);
+            
+            // 连接失败后也清理扫描结果，释放内存
+            WiFi.scanDelete();
+            Serial.println("[WIFI] 连接失败，已清理扫描结果");
+            
+            updateStatus("WiFi Connection Failed", lv_color_hex(0xef4444));
+            wifi_connection_in_progress = false;
+            wifi_connection_state = WIFI_CONN_IDLE;
+            break;
+    }
+}
+
+/**
+ * 兼容性函数：保持原有的connectWiFi接口
+ * 功能：启动非阻塞连接并等待完成（仅用于向后兼容）
+ */
+bool connectWiFi() {
+    // 启动非阻塞连接
+    if (!startWiFiConnection(ssid, password)) {
+        return false;  // 连接已在进行中
+    }
+    
+    // 注意：这里不再阻塞等待，而是立即返回true表示连接已启动
+    // 实际的连接结果将通过状态机异步处理
+    return true;
 }
 
 /**
@@ -3615,7 +4024,7 @@ void handleSerialCommands() {
         } else if (command == "show_time") {
             Serial.println("=== 当前时间信息 ===");
             struct tm timeinfo;
-            if (getLocalTime(&timeinfo)) {
+            if (getLocalTime(&timeinfo, 10)) {  // 设置10ms超时，避免阻塞
                 const char* weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
                 Serial.printf("年份: %d\n", timeinfo.tm_year + 1900);
                 Serial.printf("月份: %d\n", timeinfo.tm_mon + 1);
@@ -3633,9 +4042,14 @@ void handleSerialCommands() {
             Serial.printf("=== 设置时区为 UTC%+d ===\n", timezone);
             configTime(timezone * 3600, 0, "pool.ntp.org", "time.nist.gov");
             Serial.println("等待时间同步...");
-            delay(2000);
+            // 非阻塞等待时间同步
+            unsigned long timezoneWaitTime = millis();
+            while (millis() - timezoneWaitTime < 2000) {
+                lv_timer_handler();  // 保持UI响应
+                lv_tick_inc(1);
+            }
             struct tm timeinfo;
-            if (getLocalTime(&timeinfo)) {
+            if (getLocalTime(&timeinfo, 10)) {  // 设置10ms超时，避免阻塞
                 const char* weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
                 Serial.printf("时区设置成功！当前时间: %04d-%02d-%02d %s %02d:%02d:%02d\n", 
                     timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, 
@@ -3643,12 +4057,61 @@ void handleSerialCommands() {
             } else {
                 Serial.println("时区设置后无法获取时间，请检查网络连接");
             }
+        } else if (command == "test_touch") {
+            Serial.println("=== 开始触摸硬件测试 ===");
+            Serial.println("请触摸屏幕，测试将持续10秒...");
+            
+            unsigned long testStartTime = millis();
+            int touchCount = 0;
+            
+            while (millis() - testStartTime < 10000) {
+                // 保持UI响应
+                lv_timer_handler();
+                lv_tick_inc(1);
+                
+                // 检测触摸
+                bool tirq = touchscreen.tirqTouched();
+                bool touched = touchscreen.touched();
+                bool irq_pin = digitalRead(XPT2046_IRQ);
+                
+                if (touched) {
+                    TS_Point p = touchscreen.getPoint();
+                    touchCount++;
+                    Serial.printf("[触摸 #%d] 原始坐标: X=%d, Y=%d, Z=%d, TIRQ=%s, IRQ引脚=%s\n", 
+                                 touchCount, p.x, p.y, p.z, 
+                                 tirq ? "LOW" : "HIGH", 
+                                 irq_pin ? "HIGH" : "LOW");
+                    
+                    // 避免重复检测同一次触摸
+                    delay(100);
+                }
+                
+                // 每秒输出一次状态
+                static unsigned long lastStatusTime = 0;
+                if (millis() - lastStatusTime > 1000) {
+                    Serial.printf("[状态] TIRQ=%s, Touched=%s, IRQ引脚=%s\n", 
+                                 tirq ? "LOW" : "HIGH", 
+                                 touched ? "YES" : "NO", 
+                                 irq_pin ? "HIGH" : "LOW");
+                    lastStatusTime = millis();
+                }
+            }
+            
+            Serial.printf("=== 触摸测试完成，共检测到 %d 次触摸 ===\n", touchCount);
+            if (touchCount == 0) {
+                Serial.println("警告：未检测到任何触摸，可能存在硬件问题！");
+                Serial.println("请检查：");
+                Serial.println("1. 触摸屏连接是否正确");
+                Serial.println("2. SPI引脚配置是否正确");
+                Serial.println("3. 触摸屏是否损坏");
+            }
         } else if (command.length() > 0) {
             Serial.println("未知命令: " + command);
             Serial.println("支持的命令:");
             Serial.println("  test_anim - 测试数字滚动动画");
             Serial.println("  show_time - 显示当前时间信息");
             Serial.println("  set_timezone <offset> - 设置时区 (例如: set_timezone 8 表示UTC+8)");
+            Serial.println("  test_touch - 测试触摸硬件功能");
         }
     }
 }
@@ -3695,9 +4158,13 @@ void testNumberAnimation() {
         animatingWatchers = testWatchers;
     }
     
-    // 延迟2秒后执行第二阶段
+    // 非阻塞延迟2秒后执行第二阶段
     Serial.println("等待2秒后执行第二阶段...");
-    delay(2000);
+    unsigned long animationWaitTime = millis();
+    while (millis() - animationWaitTime < 2000) {
+        lv_timer_handler();  // 保持UI响应
+        lv_tick_inc(1);
+    }
     
     // 第二阶段：从测试值动画回原始值
     Serial.println("第二阶段：数字恢复动画");
@@ -3746,6 +4213,8 @@ void fetchGitHubData() {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("错误: WiFi未连接，无法获取数据");
         updateStatus("WiFi Disconnected", lv_color_hex(0xef4444));
+        // 确保isFetchingData标志被重置，避免影响触摸检测
+        isFetchingData = false;
         // 显示网络错误提示框，引导用户去设置
         show_network_error_message_box("Network Error", "WiFi not connected.\nCannot fetch GitHub data.\nTap OK to go to Settings.");
         return;
@@ -3779,7 +4248,7 @@ void fetchGitHubData() {
     lv_bar_set_value(progress_bar, 10, LV_ANIM_OFF);      // 设置初始进度10%
     lv_timer_handler();  // 刷新UI显示
     Serial.println("[DEBUG] UI状态已更新: 显示'Fetching data...'在左下角");
-    delay(500); // 短暂延时确保UI刷新
+    // 移除阻塞式delay，UI刷新已通过lv_timer_handler()完成
     Serial.println("[DEBUG] 开始HTTP请求流程...");
 
     // 配置HTTPS客户端，准备API请求
@@ -3795,14 +4264,36 @@ void fetchGitHubData() {
     http.begin(client, url);  // 设置请求URL
     http.addHeader("Authorization", "Bearer " + String(githubToken));  // 添加认证头
     http.addHeader("User-Agent", "ESP32-GitHub-Display");  // 添加User-Agent（GitHub API要求）
-    http.setTimeout(15000);  // 设置15秒超时
-    Serial.println("HTTP请求头已配置，超时设置为15秒");
+    http.setTimeout(5000);  // 设置5秒超时
+    Serial.println("HTTP请求头已配置，超时设置为5秒");
 
     lv_bar_set_value(progress_bar, 30, LV_ANIM_ON);  // 更新进度到30%
     lv_timer_handler();  // 刷新UI显示
     
     Serial.println("发送HTTP GET请求到GitHub API...");
-    int httpCode = http.GET();  // 发送GET请求到GitHub API
+    
+    // 发送HTTP GET请求（这个操作本身是阻塞的，但通常很快完成）
+    int httpCode = http.GET();
+    
+    // 如果请求正在进行中，等待响应但保持UI响应
+    if (httpCode == HTTP_CODE_OK || httpCode > 0) {
+        // 请求成功，继续处理
+        Serial.println("HTTP请求立即成功");
+    } else {
+        // 请求可能需要时间，在短时间内保持UI响应
+        Serial.println("HTTP请求需要等待响应...");
+        unsigned long requestStart = millis();
+        while (httpCode <= 0 && (millis() - requestStart) < 3000) {
+            lv_timer_handler();  // 保持触摸响应
+            lv_tick_inc(1);
+            delay(5);  // 减少延时
+            // 检查连接状态，避免重复GET请求
+            if (httpCode <= 0) {
+                break;  // 如果仍然没有响应，退出循环
+            }
+        }
+    }
+    
     Serial.printf("HTTP响应码: %d\n", httpCode);
     
     lv_bar_set_value(progress_bar, 70, LV_ANIM_ON);  // 更新进度到70%
@@ -4279,14 +4770,26 @@ void showCurrentTime() {
  * 格式："HH:MM:SS"（如：14:30:25）
  * 特点：每秒更新一次，显示完整的时分秒
  */
+/**
+ * 更新当前时间显示函数
+ * 功能：获取系统时间并更新界面上的时间显示标签
+ * 优化：使用非阻塞方式获取时间，避免阻塞LVGL事件处理
+ */
 void updateCurrentTimeDisplay() {
     struct tm timeinfo;
-    if (getLocalTime(&timeinfo)) {  // 尝试获取本地时间
+    // 使用非阻塞方式获取时间，设置10ms超时避免阻塞LVGL
+    if (getLocalTime(&timeinfo, 10)) {  // 尝试获取本地时间，10ms超时
         char timeStr[10];
         strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);  // 格式化时间字符串
         lv_label_set_text(current_time_label, timeStr);  // 更新时间显示
     } else {
+        // 获取时间超时或失败，显示占位符，避免阻塞UI
         lv_label_set_text(current_time_label, "--:--:--");  // 无法获取时间时显示占位符
+        static unsigned long lastTimeoutLog = 0;
+        if (millis() - lastTimeoutLog > 5000) {
+            Serial.println("[TIME] updateCurrentTimeDisplay: getLocalTime超时，避免阻塞LVGL");
+            lastTimeoutLog = millis();
+        }
     }
 }
 
@@ -4371,23 +4874,51 @@ void updateStatus(const char *message, lv_color_t color) {
 }
 
 void initDisplayAndTouch() {
-    Serial.println("初始化显示和触摸...");
+    Serial.println("=== 开始初始化显示和触摸 ===");
+    
+    // 显示屏初始化
+    Serial.println("[INIT] 初始化TFT显示屏...");
     tft.init();
     tft.setRotation(1);
     tft.setBrightness(200);
+    Serial.printf("[INIT] TFT显示屏初始化完成，分辨率: %dx%d\n", SCREEN_WIDTH, SCREEN_HEIGHT);
 
+    // 触摸屏SPI初始化
+    Serial.println("[INIT] 初始化触摸屏SPI...");
+    Serial.printf("[INIT] 触摸屏引脚配置: CLK=%d, MISO=%d, MOSI=%d, CS=%d, IRQ=%d\n", 
+                 XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS, XPT2046_IRQ);
     touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+    
+    // 触摸屏初始化
+    Serial.println("[INIT] 初始化XPT2046触摸控制器...");
     touchscreen.begin(touchscreenSPI);
     touchscreen.setRotation(1);
+    
+    // 测试触摸屏是否响应
+    Serial.println("[INIT] 测试触摸屏响应性...");
+    bool initialTirq = touchscreen.tirqTouched();
+    bool initialTouch = touchscreen.touched();
+    Serial.printf("[INIT] 初始触摸状态: TIRQ=%s, Touched=%s\n", 
+                 initialTirq ? "LOW" : "HIGH", initialTouch ? "YES" : "NO");
 
+    // LVGL初始化
+    Serial.println("[INIT] 初始化LVGL图形库...");
     lv_init();
+    
+    // 显示驱动设置
     lv_display_t *disp = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
     lv_display_set_flush_cb(disp, my_disp_flush);
     lv_display_set_buffers(disp, buf, buf2, sizeof(buf), LV_DISPLAY_RENDER_MODE_PARTIAL);
+    Serial.printf("[INIT] LVGL显示驱动设置完成，缓冲区大小: %d bytes\n", sizeof(buf));
 
+    // 输入设备设置
+    Serial.println("[INIT] 设置LVGL触摸输入设备...");
     lv_indev_t *indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touchpad_read);
+    Serial.printf("[INIT] LVGL触摸输入设备设置完成，设备指针: %p\n", indev);
+    
+    Serial.println("=== 显示和触摸初始化完成 ===");
 
     Serial.println("显示和触摸初始化完成。");
 }
@@ -4417,8 +4948,31 @@ void initDisplayAndTouch() {
 void setup() {
     // 初始化串口通信，波特率115200，用于调试输出
     Serial.begin(115200);
-    delay(1000);
+    // 移除阻塞式delay，使用非阻塞方式等待串口初始化
+    unsigned long serialStartTime = millis();
+    while (millis() - serialStartTime < 1000) {
+        // 非阻塞等待串口初始化
+    }
     Serial.println("\n===== ESP32 GitHub Stars 显示系统 (带设置功能) =====");
+    
+    // 系统启动调试信息
+    Serial.printf("[SYSTEM] ESP32芯片型号: %s\n", ESP.getChipModel());
+    Serial.printf("[SYSTEM] 芯片版本: %d\n", ESP.getChipRevision());
+    Serial.printf("[SYSTEM] CPU频率: %d MHz\n", ESP.getCpuFreqMHz());
+    Serial.printf("[SYSTEM] 可用内存: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("[SYSTEM] 最大可分配内存: %d bytes\n", ESP.getMaxAllocHeap());
+    Serial.printf("[SYSTEM] Flash大小: %d bytes\n", ESP.getFlashChipSize());
+    Serial.printf("[SYSTEM] 启动时间: %lu ms\n", millis());
+    
+    // 触摸引脚状态检查
+    Serial.println("[HARDWARE] 检查触摸引脚状态...");
+    pinMode(XPT2046_IRQ, INPUT_PULLUP);
+    bool irq_state = digitalRead(XPT2046_IRQ);
+    Serial.printf("[HARDWARE] 触摸中断引脚(GPIO%d)状态: %s\n", XPT2046_IRQ, irq_state ? "HIGH" : "LOW");
+    
+    // SPI引脚状态检查
+    Serial.printf("[HARDWARE] SPI引脚配置: CLK=%d, MISO=%d, MOSI=%d, CS=%d\n", 
+                 XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
 
     // 从NVS（非易失性存储）加载用户配置（WiFi凭据、GitHub设置等）
     load_settings();
@@ -4432,7 +4986,7 @@ void setup() {
     // 初始化WiFi模块，设置为Station模式（客户端模式）
     Serial.println("初始化WiFi模块...");
     WiFi.mode(WIFI_STA);
-    delay(100);
+    // 移除阻塞式delay，WiFi模式设置是即时的
     
     // 初始化LittleFS文件系统，用于存储历史数据
     Serial.println("初始化LittleFS文件系统...");
@@ -4498,17 +5052,23 @@ void setup() {
         // UTC-8 (美国西部): -8 * 3600
         configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");  // 设置中国时区(UTC+8)
         
-        // 等待NTP时间同步
+        // 等待NTP时间同步（非阻塞方式）
         Serial.println("等待NTP时间同步...");
         struct tm timeinfo;
         int attempts = 0;
-        while (!getLocalTime(&timeinfo) && attempts < 10) {
-            delay(1000);
+        unsigned long ntpStartTime = millis();
+        while (!getLocalTime(&timeinfo, 10) && attempts < 10) {  // 设置10ms超时，避免阻塞
+            // 非阻塞等待1秒
+            unsigned long attemptStartTime = millis();
+            while (millis() - attemptStartTime < 1000) {
+                lv_timer_handler();  // 保持UI响应
+                lv_tick_inc(1);
+            }
             attempts++;
             Serial.printf("NTP同步尝试 %d/10\n", attempts);
         }
         
-        if (getLocalTime(&timeinfo)) {
+        if (getLocalTime(&timeinfo, 10)) {  // 设置10ms超时，避免阻塞
             Serial.println("NTP时间同步成功");
             char timeStr[64];
             strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
@@ -4526,8 +5086,12 @@ void setup() {
             Serial.println("NTP时间同步失败，使用默认时间");
         }
         
-        // 延时2秒让用户看到"WiFi Connected"状态
-        delay(2000);
+        // 非阻塞延时2秒让用户看到"WiFi Connected"状态
+        unsigned long wifiConnectedTime = millis();
+        while (millis() - wifiConnectedTime < 2000) {
+            lv_timer_handler();  // 保持UI响应
+            lv_tick_inc(1);
+        }
         
         fetchGitHubData();  // 获取GitHub数据（会显示"Fetching data..."状态）
         lastDataUpdate = millis();  // 记录数据更新时间
@@ -4558,19 +5122,102 @@ void setup() {
  * 5. 定时更新进度条（每5秒）
  * 6. WiFi连接状态监控和异常处理
  */
+/**
+ * 主循环函数
+ * 功能：处理系统的主要任务循环
+ * 优化：优先处理LVGL以确保触摸响应，然后处理其他任务
+ */
 void loop() {
+    // 获取当前时间戳，用于定时任务
+    unsigned long currentMillis = millis();
+    
     // 静态变量声明，用于WiFi状态监控
     static bool wasConnected = true;
     
+    // ===== 优先处理LVGL，确保触摸响应 =====
+    // LVGL图形库必需的处理函数，处理UI事件、动画、触摸等
+    lv_timer_handler();  // 处理LVGL事件，包括触摸事件
+    lv_tick_inc(1);      // 增加LVGL内部时钟计数
+    // 移除阻塞式delay，使用非阻塞方式控制CPU占用
+    static unsigned long lastCpuControlTime = 0;
+    if (millis() - lastCpuControlTime >= 1) {
+        lastCpuControlTime = millis();
+        // 让出CPU时间片，避免占用过高
+    }
+    
+    // ===== 其他任务处理 =====
     // 处理串口命令（用于动画测试）
     handleSerialCommands();
     
-    // LVGL图形库必需的处理函数，处理UI事件、动画等
-    lv_timer_handler();
-    lv_tick_inc(1);  // 增加LVGL内部时钟计数
-    delay(1);        // 短暂延时，避免CPU占用过高
+    // 处理WiFi设置状态机（确保非阻塞）
+    static unsigned long lastWiFiStateMachine = 0;
+    if (currentMillis - lastWiFiStateMachine >= 50) {  // 限制WiFi状态机处理频率
+        processWiFiSetupStateMachine();
+        lastWiFiStateMachine = currentMillis;
+    }
+    
+    // 处理WiFi连接状态机（确保非阻塞）
+    static unsigned long lastWiFiConnectionStateMachine = 0;
+    if (currentMillis - lastWiFiConnectionStateMachine >= 50) {  // 限制WiFi连接状态机处理频率
+        processWiFiConnectionStateMachine();
+        lastWiFiConnectionStateMachine = currentMillis;
+    }
+    
+    // 处理WiFi连接成功回调
+    if (wifi_connect_success_pending && !wifi_connection_in_progress) {
+        wifi_connect_success_pending = false;
+        
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("=== WiFi连接成功回调处理 ===");
+            Serial.printf("IP地址: %s\n", WiFi.localIP().toString().c_str());
+            
+            // 显示成功消息
+            show_message_box("Success", "WiFi connected successfully!\nSettings saved.");
+            updateStatus("WiFi Connected", lv_color_hex(0x10b981));
+            
+            // 立即获取GitHub数据
+            fetchGitHubData();
+            
+            // 如果来自密码输入界面，返回设置界面
+            if (wifi_connect_from_password_screen) {
+                wifi_connect_from_password_screen = false;
+                lv_scr_load_anim(screen_settings, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 100, 0, false);
+                control_buttons_visibility(screen_settings);
+            }
+        } else {
+            Serial.println("=== WiFi连接失败回调处理 ===");
+            Serial.printf("最终状态: %d\n", WiFi.status());
+            
+            // 根据具体的失败原因显示不同的错误消息
+            switch(WiFi.status()) {
+                case WL_NO_SSID_AVAIL:
+                    Serial.println("找不到指定的SSID");
+                    show_message_box("Failure", "Network not found.\nPlease check SSID.");
+                    break;
+                case WL_CONNECT_FAILED:
+                    Serial.println("连接失败，可能是密码错误");
+                    show_message_box("Failure", "Wrong password.\nPlease try again.");
+                    break;
+                default:
+                    Serial.printf("其他错误，状态码: %d\n", WiFi.status());
+                    show_message_box("Failure", "WiFi connection failed.\nPlease check settings.");
+                    break;
+            }
+            updateStatus("WiFi Connection Failed!", lv_color_hex(0xef4444));
+            
+            // 如果来自密码输入界面，返回设置界面
+            if (wifi_connect_from_password_screen) {
+                wifi_connect_from_password_screen = false;
+                lv_scr_load_anim(screen_settings, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 100, 0, false);
+                control_buttons_visibility(screen_settings);
+            }
+        }
+    }
+    
+    // 移除了强制触摸测试代码，避免与LVGL触摸处理冲突
+    // 触摸处理现在完全由my_touchpad_read函数负责
+    
 
-    unsigned long currentMillis = millis();  // 获取当前时间戳，用于定时任务
 
     // 处理WiFi网络扫描结果，更新WiFi列表界面
     int n = WiFi.scanComplete();
@@ -4589,33 +5236,234 @@ void loop() {
             lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);  // 显示"未找到网络"提示
         } else {
             // 找到WiFi网络，添加到列表中
-            Serial.println("添加WiFi网络到列表:");
+            Serial.printf("WiFi扫描成功！找到 %d 个网络，添加到列表:\n", n);
             for (int i = 0; i < n; ++i) {
                 String ssid = WiFi.SSID(i);
-                Serial.printf("  %d: %s (信号强度: %d dBm)\n", i, ssid.c_str(), WiFi.RSSI(i));
-                // 为每个WiFi网络创建列表项按钮
-                lv_obj_t* btn = lv_list_add_btn(list, LV_SYMBOL_WIFI, ssid.c_str());
+                int rssi = WiFi.RSSI(i);
+                Serial.printf("  %d: %s (信号强度: %d dBm)\n", i, ssid.c_str(), rssi);
+                
+                // 创建持久化的字符串副本，避免String对象销毁导致的内存问题
+                char* ssid_copy = (char*)malloc(ssid.length() + 1);
+                if (ssid_copy != NULL) {
+                    strcpy(ssid_copy, ssid.c_str());
+                    
+                    // 为每个WiFi网络创建列表项按钮
+                    lv_obj_t* btn = lv_list_add_btn(list, LV_SYMBOL_WIFI, ssid_copy);
+                    
+                    // 将字符串指针存储在按钮的用户数据中，以便后续释放
+                    lv_obj_set_user_data(btn, ssid_copy);
+                } else {
+                    Serial.printf("[ERROR] 无法为SSID分配内存: %s\n", ssid.c_str());
+                    continue;
+                }
+                
+                // 获取刚创建的按钮进行样式设置
+                lv_obj_t* btn = lv_obj_get_child(list, lv_obj_get_child_cnt(list) - 1);
+                
+                // 根据信号强度设置不同的颜色
+                uint32_t btn_color = 0x334155;  // 默认深灰
+                if (rssi > -50) {
+                    btn_color = 0x065f46;  // 强信号：深绿
+                } else if (rssi > -70) {
+                    btn_color = 0x1f2937;  // 中等信号：深灰蓝
+                } else {
+                    btn_color = 0x7f1d1d;  // 弱信号：深红
+                }
+                
                 // 设置按钮样式，使其与列表背景协调
-                lv_obj_set_style_bg_color(btn, lv_color_hex(0x334155), 0);  // 深灰背景
+                lv_obj_set_style_bg_color(btn, lv_color_hex(btn_color), 0);
                 lv_obj_set_style_bg_grad_color(btn, lv_color_hex(0x475569), 0);  // 渐变
                 lv_obj_set_style_bg_grad_dir(btn, LV_GRAD_DIR_VER, 0);
                 lv_obj_set_style_text_color(btn, lv_color_hex(0xf1f5f9), 0);  // 浅色文字
+                
                 // 为按钮文本设置支持中文的字体
                 lv_obj_t* label = lv_obj_get_child(btn, 1); // 获取按钮内的文本标签
                 lv_obj_set_style_text_font(label, &lv_font_simsun_16_cjk, 0);
                 lv_obj_set_style_text_color(label, lv_color_hex(0xf1f5f9), 0);  // 浅色文字
                 lv_obj_add_event_cb(btn, wifi_list_event_cb, LV_EVENT_CLICKED, NULL);
             }
+            
+            // 扫描成功，重置所有错误计数器
+        wifi_scan_timeout_count = 0;
+        wifi_setup_retry_count = 0;
+        wifi_reset_attempt_count = 0;
+        
+        // 设置扫描完成标志，后续将跳过自动扫描
+        wifi_scan_completed_once = true;
+        Serial.println("[WIFI] 设置扫描完成标志，后续将跳过自动扫描");
+        
+        // 设置扫描成功时间戳，用于虚假失败事件检测
+        wifi_scan_success_time = millis();
+        Serial.println("[WIFI] 设置扫描成功时间戳，启用虚假失败事件检测");
+        
+        // 扫描成功后不立即删除结果，保留供用户选择网络
+        // WiFi.scanDelete(); // 注释掉：扫描成功后不应该立即删除结果
+        
+        // 重置扫描状态但保留扫描结果
+        wifi_scan_in_progress = false;
+        Serial.println("WiFi扫描结果处理完成，状态已重置（保留扫描结果）");
         }
-        WiFi.scanDelete();  // 清除扫描结果，释放内存
-        Serial.println("WiFi扫描结果处理完成");
     } else if (n == WIFI_SCAN_RUNNING) {
-        // WiFi扫描仍在进行中，定期输出状态信息
+        // WiFi扫描仍在进行中，提供详细的进度监控
         static unsigned long lastScanStatus = 0;
-        if (millis() - lastScanStatus > 10000) {
-            Serial.println("WiFi扫描仍在进行中...");
+        static int scan_progress_dots = 0;
+        
+        if (millis() - lastScanStatus > 3000) {  // 每3秒更新一次状态
+            unsigned long scan_duration = millis() - wifi_scan_start_time;
+            scan_progress_dots = (scan_progress_dots + 1) % 4;  // 0-3循环
+            
+            // 创建动态进度提示
+            String progress_text = "Scanning";
+            for (int i = 0; i < scan_progress_dots; i++) {
+                progress_text += ".";
+            }
+            progress_text += " (" + String(scan_duration / 1000) + "s)";
+            
+            // 更新UI显示
+            if (screen_wifi_list != NULL) {
+                lv_obj_t* label = lv_obj_get_child(screen_wifi_list, 2);
+                if (label != NULL) {
+                    lv_label_set_text(label, progress_text.c_str());
+                    lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
+                }
+            }
+            
+            Serial.printf("[WIFI] WiFi扫描进行中... 已用时: %lu秒\n", scan_duration / 1000);
+            
+            // 检查是否接近超时
+            if (scan_duration > 25000) {  // 25秒警告
+                Serial.println("[WIFI] 警告：WiFi扫描即将超时");
+            }
+            
             lastScanStatus = millis();
         }
+    } else if (n == WIFI_SCAN_FAILED) {
+        // 防止重复处理同一个扫描失败事件
+        static unsigned long lastFailureTime = 0;
+        unsigned long currentTime = millis();
+        
+        // 检查是否是扫描成功后scanDelete()引起的虚假失败事件
+        static unsigned long ignore_window = 5000;  // 动态调整的忽略窗口时间
+        static bool ignore_detection_disabled = false;  // 虚假事件检测禁用标志
+        
+        if (wifi_scan_success_time > 0 && currentTime - wifi_scan_success_time < ignore_window && !ignore_detection_disabled) {
+            static int ignore_count = 0;
+            static unsigned long last_ignore_reset = 0;
+            
+            // 每60秒重置一次计数器，避免无限累加
+            if (currentTime - last_ignore_reset > 60000) {
+                // 如果虚假事件过多，考虑暂时禁用检测
+                if (ignore_count > 500) {
+                    ignore_detection_disabled = true;
+                    Serial.println("[WIFI] 虚假事件过多，暂时禁用虚假失败事件检测");
+                } else if (ignore_count > 100) {
+                    ignore_window = min(ignore_window + 1000, 10000UL);  // 最大10秒
+                    Serial.printf("[WIFI] 虚假事件过多，延长忽略窗口至%lu毫秒\n", ignore_window);
+                }
+                ignore_count = 0;
+                last_ignore_reset = currentTime;
+                Serial.println("[WIFI] 重置虚假失败事件计数器");
+            }
+            
+            ignore_count++;
+            // 优化日志输出：前3次记录，之后每100次记录一次，进一步减少日志噪音
+            if (ignore_count <= 3 || ignore_count % 100 == 0) {
+                Serial.printf("[WIFI] 忽略虚假失败事件 (第%d次)\n", ignore_count);
+            }
+            return;
+        } else if (wifi_scan_success_time > 0) {
+            // 超过忽略窗口时间后重置成功时间标记，允许处理真实的失败事件
+            wifi_scan_success_time = 0;
+            // 逐渐恢复忽略窗口时间到默认值
+            if (ignore_window > 5000) {
+                ignore_window = max(ignore_window - 500, 5000UL);
+                Serial.printf("[WIFI] 恢复忽略窗口至%lu毫秒\n", ignore_window);
+            }
+            // 重新启用虚假事件检测
+            if (ignore_detection_disabled) {
+                ignore_detection_disabled = false;
+                Serial.println("[WIFI] 重新启用虚假失败事件检测");
+            }
+            Serial.println("[WIFI] 重置虚假失败事件检测标记");
+        }
+        
+        if (currentTime - lastFailureTime < 1000) {
+            // 1秒内的重复失败事件，忽略
+            return;
+        }
+        lastFailureTime = currentTime;
+        
+        // WiFi扫描失败，针对错误码-2进行特殊处理
+        Serial.printf("WiFi扫描失败，错误码: %d，超时次数: %d\n", n, wifi_scan_timeout_count);
+        lv_obj_t* list = lv_obj_get_child(screen_wifi_list, 1);   // 获取WiFi列表控件
+        lv_obj_t* label = lv_obj_get_child(screen_wifi_list, 2);  // 获取状态标签控件
+        
+        // 清空列表并显示智能错误信息
+        cleanupWiFiListMemory(list);  // 清理分配的内存
+        lv_obj_clean(list);
+        
+        // 针对错误码-2（WIFI_SCAN_FAILED）进行特殊处理
+        if (n == -2) {
+            Serial.println("[WIFI] 检测到错误码-2，WiFi扫描功能异常");
+            
+            // 错误码-2通常表示WiFi模块扫描功能异常，需要更激进的恢复策略
+            if (wifi_scan_timeout_count < 2) {
+                lv_label_set_text(label, "WiFi scan error (-2). Quick retry...");
+                // 对于错误码-2，立即进行快速重试
+                wifi_scan_timeout_count++;
+                wifi_setup_state = WIFI_SETUP_SCAN_RETRY;
+                wifi_setup_timer = millis();
+                Serial.printf("[WIFI] 错误码-2快速重试 (第%d次失败)\n", wifi_scan_timeout_count);
+            } else if (wifi_scan_timeout_count < 4) {
+                lv_label_set_text(label, "WiFi module issue. Resetting...");
+                // 错误码-2多次出现，立即启动WiFi模块重置
+                wifi_scan_timeout_count++;
+                wifi_setup_state = WIFI_SETUP_RESET_DISCONNECT;
+                wifi_setup_timer = millis();
+                wifi_reset_attempt_count = 0;
+                Serial.printf("[WIFI] 错误码-2触发WiFi重置 (第%d次失败)\n", wifi_scan_timeout_count);
+            } else {
+                lv_label_set_text(label, "WiFi hardware error. Manual retry needed.");
+                // 错误码-2持续出现，可能是硬件问题
+                wifi_scan_timeout_count = 0;
+                wifi_setup_retry_count = 0;
+                wifi_reset_attempt_count = 0;
+                wifi_setup_state = WIFI_SETUP_IDLE;
+                Serial.println("[WIFI] 错误码-2持续出现，可能存在硬件问题");
+            }
+        } else {
+             // 其他错误码的通用处理
+             if (wifi_scan_timeout_count < 3) {
+                 lv_label_set_text(label, "Scan failed. Auto-retrying...");
+                 // 增加失败计数器，防止无限循环
+                 wifi_scan_timeout_count++;
+                 // 自动启动智能重试流程
+                 wifi_setup_state = WIFI_SETUP_SCAN_RETRY;
+                 wifi_setup_timer = millis();
+                 Serial.printf("[WIFI] 启动自动重试流程 (第%d次失败)\n", wifi_scan_timeout_count);
+             } else if (wifi_scan_timeout_count < 6) {
+                  lv_label_set_text(label, "Multiple failures. Resetting WiFi...");
+                  // 启动WiFi模块重置流程
+                  wifi_setup_state = WIFI_SETUP_RESET_DISCONNECT;
+                  wifi_setup_timer = millis();
+                  wifi_reset_attempt_count = 0;
+                  Serial.println("[WIFI] 启动WiFi模块重置流程");
+              } else {
+                  lv_label_set_text(label, "WiFi module error. Tap to retry.");
+                  // 重置所有计数器，等待用户手动重试
+                  wifi_scan_timeout_count = 0;
+                  wifi_setup_retry_count = 0;
+                  wifi_reset_attempt_count = 0;
+                  wifi_setup_state = WIFI_SETUP_IDLE;
+                  Serial.println("[WIFI] WiFi模块可能存在硬件问题，等待用户手动重试");
+              }
+         }
+        
+        lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
+        
+        // 清除失败的扫描结果
+        WiFi.scanDelete();
+        wifi_scan_in_progress = false;
     }
 
     // 处理"更新成功"状态显示的超时（显示3秒后恢复正常状态）
@@ -4654,7 +5502,8 @@ void loop() {
     static unsigned long lastWeatherTimeCheck = 0;
     if (WiFi.status() == WL_CONNECTED && currentMillis - lastWeatherTimeCheck >= 60000) { // 每分钟检查一次
         struct tm timeinfo;
-        if (getLocalTime(&timeinfo)) {
+        // 使用非阻塞方式获取时间，避免阻塞LVGL事件处理
+        if (getLocalTime(&timeinfo, 10)) {  // 设置10ms超时，避免长时间阻塞
             int currentHour = timeinfo.tm_hour;
             int currentMinute = timeinfo.tm_min;
             
@@ -4674,6 +5523,8 @@ void loop() {
                     }
                 }
             }
+        } else {
+            Serial.println("[TIME] getLocalTime超时，跳过时间检查以避免阻塞LVGL");
         }
         lastWeatherTimeCheck = currentMillis;
     }
