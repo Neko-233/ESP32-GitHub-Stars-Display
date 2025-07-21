@@ -232,8 +232,10 @@ int wifi_scan_timeout_count = 0;           // WiFi扫描超时计数器
 int wifi_reset_attempt_count = 0;          // WiFi模块重置尝试计数器
 unsigned long wifi_scan_start_time = 0;    // WiFi扫描开始时间
 bool wifi_scan_in_progress = false;        // WiFi扫描进行中标志
-unsigned long wifi_scan_success_time = 0;  // WiFi扫描成功时间，用于避免scanDelete()的虚假失败事件
+// 移除wifi_scan_success_time变量，改用wifi_scan_completed_once标志
 bool wifi_scan_completed_once = false;      // WiFi扫描是否已成功完成过一次
+int last_processed_scan_result = -1;        // 上次处理的WiFi扫描结果数量，用于防止重复处理
+unsigned long last_scan_process_time = 0;   // 上次处理WiFi扫描结果的时间戳
 int wifi_connection_attempts = 0;
 String wifi_setup_saved_ssid = "";
 String wifi_setup_saved_password = "";
@@ -377,6 +379,7 @@ void fetchGitHubData();                                       // 获取GitHub仓
 void saveStarData(int starCount);                             // 保存星标数据到文件
 void saveDailyStarData(int starCount);                        // 保存每日星标数据
 void saveGrowthData(int starCount);                           // 保存增长数据
+void cleanupOldData();                                        // 清理旧数据
 void checkAndSaveDailyData();                                 // 检查并保存每日数据（23:59调用）
 void loadChartData();                                         // 从文件加载图表数据
 void updateChartDisplay();                                    // 更新图表显示
@@ -398,7 +401,7 @@ static void show_keyboard_event_cb(lv_event_t * e);          // 显示虚拟键�
 void city_input_ta_event_cb(lv_event_t * e);                 // 城市输入文本框事件回调
 static void edit_field_event_cb(lv_event_t * e);             // 编辑字段事件回调
 static void save_field_event_cb(lv_event_t * e);             // 保存字段事件回调
-static void stars_card_event_cb(lv_event_t * e);             // 星星卡片点击事件回调
+static void stars_card_event_cb(lv_event_t * e);             // 星星卡片长按事件回调
 static void chart_back_event_cb(lv_event_t * e);             // 图表界面返回事件回调
 static void chart_mode_event_cb(lv_event_t * e);             // 图表模式切换事件回调
 
@@ -428,27 +431,19 @@ void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
  *   - data: 触摸数据输出结构体
  */
 void my_touchpad_read(lv_indev_t *indev_driver, lv_indev_data_t *data) {
-    // 直接检测触摸状态
-    bool is_touched = touchscreen.touched();
-    
-    if (is_touched) {
+    // 检查触摸中断引脚和触摸状态
+    if (touchscreen.tirqTouched() && touchscreen.touched()) {
         TS_Point p = touchscreen.getPoint();  // 获取原始触摸坐标
         
-        // 检查坐标是否有效（避免无效的触摸数据）
-        if (p.x > 100 && p.x < 4000 && p.y > 100 && p.y < 4000 && p.z > 200) {
-            // 坐标映射：将XPT2046的原始坐标转换为屏幕坐标
-            // 针对ESP32-2432S028R的触摸校准参数
-            int mapped_x = map(p.x, 200, 3700, SCREEN_WIDTH - 1, 0);   // X轴映射
-            int mapped_y = map(p.y, 240, 3800, SCREEN_HEIGHT - 1, 0);  // Y轴映射
+        // 坐标映射：将XPT2046的原始坐标转换为屏幕坐标
+        // 针对ESP32-2432S028R的触摸校准参数
+        int mapped_x = map(p.x, 200, 3700, SCREEN_WIDTH - 1, 0);   // X轴映射
+        int mapped_y = map(p.y, 240, 3800, SCREEN_HEIGHT - 1, 0);  // Y轴映射
 
-            // 坐标约束：确保坐标值在屏幕范围内，防止越界
-            data->point.x = constrain(mapped_x, 0, SCREEN_WIDTH - 1);
-            data->point.y = constrain(mapped_y, 0, SCREEN_HEIGHT - 1);
-            data->state = LV_INDEV_STATE_PR;  // 设置触摸状态为按下
-        } else {
-            // 无效的触摸数据，忽略
-            data->state = LV_INDEV_STATE_REL;
-        }
+        // 坐标约束：确保坐标值在屏幕范围内，防止越界
+        data->point.x = constrain(mapped_x, 0, SCREEN_WIDTH - 1);
+        data->point.y = constrain(mapped_y, 0, SCREEN_HEIGHT - 1);
+        data->state = LV_INDEV_STATE_PR;  // 设置触摸状态为按下
     } else {
         data->state = LV_INDEV_STATE_REL;  // 设置触摸状态为释放（未触摸）
     }
@@ -2557,7 +2552,8 @@ void create_wifi_list_screen() {
                 wifi_setup_state = WIFI_SETUP_SCAN_START;
                 wifi_setup_retry_count = 0;
                 wifi_scan_completed_once = false;  // 重置扫描完成标志，允许重新扫描
-                wifi_scan_success_time = 0;  // 重置扫描成功时间戳，避免虚假失败事件检测问题
+                // 移除wifi_scan_success_time重置，改用wifi_scan_completed_once标志
+                last_processed_scan_result = -1;  // 重置重复处理保护
                 WiFi.scanDelete();
                 delay(100);
                 
@@ -3134,7 +3130,94 @@ void create_edit_token_screen() {
 }
 
 /**
- * 主界面滑动手势事件回调函数
+ * 全局滑动手势事件回调函数
+ * 功能：处理所有界面的左右滑动手势，具有最高优先级
+ * 参数：e - LVGL事件对象
+ * 特点：
+ * - 在任何界面都能响应左右滑动手势
+ * - 左滑：切换到日历界面
+ * - 右滑：切换到天气界面或返回主界面
+ * - 具有最高优先级，优先于其他事件处理
+ */
+static void global_gesture_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    
+    if (code == LV_EVENT_GESTURE) {
+        lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+        lv_obj_t* current_screen = lv_scr_act();
+        
+        Serial.printf("[GLOBAL_GESTURE] 检测到全局手势事件，方向: %d，当前屏幕: %p\n", dir, current_screen);
+        
+        if (dir == LV_DIR_LEFT) {
+            if (current_screen == main_screen) {
+                // 主界面左滑到日历界面
+                Serial.println("[GLOBAL_GESTURE] 主界面左滑，切换到日历界面");
+                // 删除旧的日历界面（如果存在）
+                if (screen_calendar != NULL) {
+                    lv_obj_del(screen_calendar);
+                    screen_calendar = NULL;
+                }
+                // 重新创建日历界面
+                create_calendar_screen();
+                lv_scr_load_anim(screen_calendar, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+                control_buttons_visibility(screen_calendar);
+                updatePageIndicator(2);
+            } else if (current_screen == screen_calendar) {
+                // 日历界面左滑到主界面
+                Serial.println("[GLOBAL_GESTURE] 日历界面左滑，返回主界面");
+                lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+                control_buttons_visibility(main_screen);
+                updatePageIndicator(1);
+            } else if (current_screen == screen_weather) {
+                // 天气界面左滑无效
+                Serial.println("[GLOBAL_GESTURE] 天气界面左滑无效");
+            }
+        }
+        else if (dir == LV_DIR_RIGHT) {
+            if (current_screen == main_screen) {
+                // 主界面右滑到天气界面
+                Serial.println("[GLOBAL_GESTURE] 主界面右滑，切换到天气界面");
+                if (screen_weather == NULL) {
+                    create_weather_screen();
+                }
+                lv_scr_load_anim(screen_weather, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+                control_buttons_visibility(screen_weather);
+                updatePageIndicator(0);
+            } else if (current_screen == screen_weather) {
+                // 天气界面右滑到主界面
+                Serial.println("[GLOBAL_GESTURE] 天气界面右滑，返回主界面");
+                lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+                control_buttons_visibility(main_screen);
+                updatePageIndicator(1);
+            } else if (current_screen == screen_calendar) {
+                // 日历界面右滑无效
+                Serial.println("[GLOBAL_GESTURE] 日历界面右滑无效");
+            }
+        }
+        else {
+            Serial.printf("[GLOBAL_GESTURE] 未识别的手势方向: %d (LV_DIR_LEFT=%d, LV_DIR_RIGHT=%d)\n", dir, LV_DIR_LEFT, LV_DIR_RIGHT);
+        }
+    }
+}
+
+/**
+ * 为屏幕添加全局手势处理的辅助函数
+ * 功能：为指定屏幕添加全局手势事件处理器
+ * 参数：screen - 要添加手势处理的屏幕对象
+ * 特点：
+ * - 确保所有屏幕都支持全局左右滑动手势
+ * - 设置最高优先级，不允许手势事件冒泡
+ */
+void add_global_gesture_to_screen(lv_obj_t* screen) {
+    if (screen != NULL) {
+        lv_obj_add_event_cb(screen, global_gesture_event_cb, LV_EVENT_GESTURE, NULL);
+        lv_obj_clear_flag(screen, LV_OBJ_FLAG_GESTURE_BUBBLE);
+        Serial.printf("[GLOBAL_GESTURE] 已为屏幕 %p 添加全局手势处理\n", screen);
+    }
+}
+
+/**
+ * 主界面滑动手势事件回调函数（已废弃，保留用于兼容性）
  * 功能：处理主界面的左右滑动手势，实现天气和日历界面的切换
  * 参数：e - LVGL事件对象
  */
@@ -3143,10 +3226,11 @@ static void main_screen_gesture_event_cb(lv_event_t * e) {
     
     if (code == LV_EVENT_GESTURE) {
         lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+        Serial.printf("[GESTURE] 检测到手势事件，方向: %d\n", dir);
         
         if (dir == LV_DIR_LEFT) {
             // 左滑显示日历界面
-            Serial.println("主界面左滑，切换到日历界面");
+            Serial.println("[GESTURE] 主界面左滑，切换到日历界面");
             // 删除旧的日历界面（如果存在）
             if (screen_calendar != NULL) {
                 lv_obj_del(screen_calendar);
@@ -3161,7 +3245,7 @@ static void main_screen_gesture_event_cb(lv_event_t * e) {
         }
         else if (dir == LV_DIR_RIGHT) {
             // 右滑显示天气界面
-            Serial.println("主界面右滑，切换到天气界面");
+            Serial.println("[GESTURE] 主界面右滑，切换到天气界面");
             if (screen_weather == NULL) {
                 create_weather_screen();
             }
@@ -3169,6 +3253,9 @@ static void main_screen_gesture_event_cb(lv_event_t * e) {
             control_buttons_visibility(screen_weather);
             // 更新页面指示器状态
             updatePageIndicator(0);
+        }
+        else {
+            Serial.printf("[GESTURE] 未识别的手势方向: %d (LV_DIR_LEFT=%d, LV_DIR_RIGHT=%d)\n", dir, LV_DIR_LEFT, LV_DIR_RIGHT);
         }
     }
 }
@@ -3179,8 +3266,8 @@ void createUI() {
     lv_obj_set_style_bg_grad_color(main_screen, lv_color_hex(0x1a1a2e), 0);
     lv_obj_set_style_bg_grad_dir(main_screen, LV_GRAD_DIR_VER, 0);
     
-    // 添加滑动手势支持
-    lv_obj_add_event_cb(main_screen, main_screen_gesture_event_cb, LV_EVENT_GESTURE, NULL);
+    // 添加全局滑动手势支持
+    lv_obj_add_event_cb(main_screen, global_gesture_event_cb, LV_EVENT_GESTURE, NULL);
     lv_obj_clear_flag(main_screen, LV_OBJ_FLAG_GESTURE_BUBBLE);
     
     // --- 标题区域 ---
@@ -3209,7 +3296,11 @@ void createUI() {
     
     // 添加点击事件处理
     lv_obj_add_flag(stars_container, LV_OBJ_FLAG_CLICKABLE);
+    // 只监听长按事件
     lv_obj_add_event_cb(stars_container, stars_card_event_cb, LV_EVENT_LONG_PRESSED, NULL);
+    
+    // 允许手势事件传播到父对象（主界面）
+    lv_obj_add_flag(stars_container, LV_OBJ_FLAG_GESTURE_BUBBLE);
     
     // 添加按下效果样式
     lv_obj_set_style_bg_color(stars_container, lv_color_hex(0x1e40af), LV_STATE_PRESSED);
@@ -3248,6 +3339,9 @@ void createUI() {
     lv_obj_set_style_border_width(info_container, 0, 0);
     lv_obj_set_style_radius(info_container, 10, 0);
     lv_obj_clear_flag(info_container, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // 允许手势事件传播到父对象（主界面）
+    lv_obj_add_flag(info_container, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
     lv_obj_t* forks_icon = lv_label_create(info_container);
     lv_label_set_text(forks_icon, FA_CODE_BRANCH);
@@ -3282,6 +3376,9 @@ void createUI() {
     lv_obj_set_style_radius(status_bar, 0, 0);
     lv_obj_set_style_pad_hor(status_bar, 10, 0);
     lv_obj_clear_flag(status_bar, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // 允许手势事件传播到父对象（主界面）
+    lv_obj_add_flag(status_bar, LV_OBJ_FLAG_GESTURE_BUBBLE);
     
     status_label = lv_label_create(status_bar);
     lv_label_set_text(status_label, "Status: Initializing...");
@@ -3325,25 +3422,8 @@ void create_weather_screen() {
     lv_obj_set_style_bg_grad_color(screen_weather, lv_color_hex(0x1e3a8a), 0);  // 渐变色
     lv_obj_set_style_bg_grad_dir(screen_weather, LV_GRAD_DIR_VER, 0);
     
-    // 添加滑动手势支持（返回主界面）
-    lv_obj_add_event_cb(screen_weather, [](lv_event_t * e) {
-        lv_event_code_t code = lv_event_get_code(e);
-        if (code == LV_EVENT_GESTURE) {
-            lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
-            if (dir == LV_DIR_LEFT) {
-                Serial.println("天气界面左滑，返回主界面");
-                if (main_screen != NULL) {
-                    lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
-                    control_buttons_visibility(main_screen);
-                    // 更新页面指示器状态
-                    updatePageIndicator(1);
-                } else {
-                    Serial.println("错误：main_screen为NULL");
-                }
-            }
-        }
-    }, LV_EVENT_GESTURE, NULL);
-    lv_obj_clear_flag(screen_weather, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    // 添加全局手势处理
+    add_global_gesture_to_screen(screen_weather);
     
     // 获取当前时间用于显示日期
     struct tm timeinfo;
@@ -3510,25 +3590,8 @@ void create_calendar_screen() {
     lv_obj_set_style_bg_grad_color(screen_calendar, lv_color_hex(0x1a1a2e), 0);  // 与主页相同的渐变色
     lv_obj_set_style_bg_grad_dir(screen_calendar, LV_GRAD_DIR_VER, 0);
     
-    // 添加滑动手势支持（返回主界面）
-    lv_obj_add_event_cb(screen_calendar, [](lv_event_t * e) {
-        lv_event_code_t code = lv_event_get_code(e);
-        if (code == LV_EVENT_GESTURE) {
-            lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
-            if (dir == LV_DIR_RIGHT) {
-                Serial.println("日历界面右滑，返回主界面");
-                if (main_screen != NULL) {
-                    lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
-                    control_buttons_visibility(main_screen);
-                    // 更新页面指示器状态
-                    updatePageIndicator(1);
-                } else {
-                    Serial.println("错误：main_screen为NULL");
-                }
-            }
-        }
-    }, LV_EVENT_GESTURE, NULL);
-    lv_obj_clear_flag(screen_calendar, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    // 添加全局手势处理
+    add_global_gesture_to_screen(screen_calendar);
     
     // 获取当前真实时间（统一声明）
     struct tm timeinfo;
@@ -3942,20 +4005,94 @@ void processWiFiConnectionStateMachine() {
             break;
             
         case WIFI_CONN_SUCCESS:
-            // 连接成功处理
-            Serial.println("=== WiFi连接成功! ===");
-            Serial.printf("IP地址: %s\n", WiFi.localIP().toString().c_str());
-            Serial.printf("信号强度: %d dBm\n", WiFi.RSSI());
-            Serial.printf("网关: %s\n", WiFi.gatewayIP().toString().c_str());
-            Serial.printf("DNS: %s\n", WiFi.dnsIP().toString().c_str());
-            
-            // 连接成功后清理扫描结果，释放内存
-            WiFi.scanDelete();
-            Serial.println("[WIFI] 连接成功，已清理扫描结果");
-            
-            updateStatus("WiFi Connected", lv_color_hex(0x10b981));
-            wifi_connection_in_progress = false;
-            wifi_connection_state = WIFI_CONN_IDLE;
+            {
+                // 使用静态变量确保WiFi连接成功信息只打印一次
+                static bool wifi_success_logged = false;
+                static unsigned long ntp_sync_start_time = 0;
+                static int ntp_sync_attempts = 0;
+                static bool ntp_sync_in_progress = false;
+                static bool ntp_config_done = false;
+                
+                // 只在第一次进入时打印连接成功信息
+                if (!wifi_success_logged) {
+                    Serial.println("=== WiFi连接成功! ===");
+                    Serial.printf("IP地址: %s\n", WiFi.localIP().toString().c_str());
+                    Serial.printf("信号强度: %d dBm\n", WiFi.RSSI());
+                    Serial.printf("网关: %s\n", WiFi.gatewayIP().toString().c_str());
+                    Serial.printf("DNS: %s\n", WiFi.dnsIP().toString().c_str());
+                    
+                    // 连接成功后清理扫描结果，释放内存
+                    WiFi.scanDelete();
+                    Serial.println("[WIFI] 连接成功，已清理扫描结果");
+                    
+                    wifi_success_logged = true;
+                }
+                
+                // 只在第一次进入时配置NTP
+                if (!ntp_config_done) {
+                    Serial.println("开始NTP时间同步...");
+                    configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");  // 设置为UTC+8时区
+                    Serial.println("等待NTP时间同步...");
+                    ntp_config_done = true;
+                }
+                
+                // 初始化NTP同步状态
+                if (!ntp_sync_in_progress) {
+                    ntp_sync_start_time = millis();
+                    ntp_sync_attempts = 0;
+                    ntp_sync_in_progress = true;
+                }
+                
+                // 检查NTP同步状态（非阻塞）
+                struct tm timeinfo;
+                if (getLocalTime(&timeinfo, 10)) {  // 10ms超时，避免阻塞
+                    // NTP同步成功
+                    Serial.println("NTP时间同步成功!");
+                    const char* weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+                    Serial.printf("当前时间: %04d-%02d-%02d %s %02d:%02d:%02d\n", 
+                        timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, 
+                        weekdays[timeinfo.tm_wday], timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+                    
+                    // // 开始获取GitHub数据
+                    // Serial.println("开始获取GitHub数据...");
+                    // fetchGitHubData();
+                    
+                    // 重置所有静态变量，为下次连接做准备
+                    wifi_success_logged = false;
+                    ntp_sync_in_progress = false;
+                    ntp_config_done = false;
+                    
+                    updateStatus("WiFi Connected", lv_color_hex(0x10b981));
+                    wifi_connection_in_progress = false;
+                    wifi_connection_state = WIFI_CONN_IDLE;
+                } else {
+                    // NTP同步尚未完成，检查超时
+                    if (millis() - ntp_sync_start_time > 1000) {  // 每秒检查一次
+                        ntp_sync_attempts++;
+                        Serial.printf("NTP同步尝试 %d/10\n", ntp_sync_attempts);
+                        ntp_sync_start_time = millis();
+                        
+                        if (ntp_sync_attempts >= 10) {
+                            // NTP同步失败，使用默认时间
+                            Serial.println("NTP时间同步失败，使用默认时间。");
+                            
+                            // 即使NTP失败，也尝试获取GitHub数据
+                            Serial.println("开始获取GitHub数据...");
+                            fetchGitHubData();
+                            
+                            // 重置所有静态变量，为下次连接做准备
+                            wifi_success_logged = false;
+                            ntp_sync_in_progress = false;
+                            ntp_config_done = false;
+                            
+                            wifi_connection_in_progress = false;
+                            wifi_connection_state = WIFI_CONN_IDLE;
+                        }
+                    }
+                    // 如果NTP同步仍在进行中，保持当前状态，不改变wifi_connection_state
+                    return;  // 继续等待NTP同步
+                }
+            }
             break;
             
         case WIFI_CONN_FAILED:
@@ -4347,6 +4484,7 @@ void fetchGitHubData() {
             updateStatus("Update successful", lv_color_hex(0x10b981));
             showingUpdateSuccess = true;     // 标记正在显示更新成功状态
             updateSuccessTime = millis();    // 记录成功时间，用于3秒后恢复正常显示
+            // lastDataUpdate 已在调用fetchGitHubData前设置，避免重复设置
             lv_label_set_text(time_label, "Last Upd: <1 min");  // 立即更新时间显示
             
             // 清除重试状态（数据获取成功）
@@ -4737,8 +4875,12 @@ void updateTimeDisplay() {
             lv_label_set_text_fmt(time_label, "Last Upd: %lu mins", timeSinceUpdate);
         }
     } else {
-        // 系统启动后从未成功更新过数据
-        lv_label_set_text(time_label, "Last Upd: --");
+        // 系统启动后从未开始数据更新流程，提示等待WiFi连接
+        if (WiFi.status() == WL_CONNECTED) {
+            lv_label_set_text(time_label, "Preparing update...");
+        } else {
+            lv_label_set_text(time_label, "Last Upd: --");
+        }
     }
 }
 
@@ -4850,8 +4992,11 @@ void updateProgressBar() {
         } else {
             // 计算剩余时间百分比（从100%递减到0%）
             int progress = 100 - (timeSinceUpdate * 100) / UPDATE_INTERVAL;
-            lv_bar_set_value(progress_bar, progress > 0 ? progress : 0, LV_ANIM_OFF);
-
+            // 确保进度条不会显示负值，最小为0%
+            if (progress < 0) progress = 0;
+            // 确保进度条不会超过100%（防止时间计算异常）
+            if (progress > 100) progress = 100;
+            lv_bar_set_value(progress_bar, progress, LV_ANIM_OFF);
         }
     } else {
         // 从未更新过数据，隐藏进度条
@@ -4916,6 +5061,14 @@ void initDisplayAndTouch() {
     lv_indev_t *indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touchpad_read);
+    
+    // 注意：LVGL 9.x中无法直接设置长按时间，使用默认值（约400ms）
+    Serial.println("[INIT] 使用LVGL默认长按时间（约400ms）");
+    
+    // 注意：当前LVGL版本不支持手势参数配置函数
+    // 手势识别使用LVGL默认参数，如需调整请升级LVGL版本
+    Serial.println("[INIT] 使用LVGL默认手势识别参数");
+    
     Serial.printf("[INIT] LVGL触摸输入设备设置完成，设备指针: %p\n", indev);
     
     Serial.println("=== 显示和触摸初始化完成 ===");
@@ -5043,64 +5196,17 @@ void setup() {
 
     // 加载主屏幕并尝试建立网络连接
     lv_scr_load(main_screen);
-    if (connectWiFi()) {
-        // WiFi连接成功，配置时区并获取GitHub数据
-        // 注意：如果您不在中国时区，请修改时区偏移量
-        // UTC+8 (中国): 8 * 3600
-        // UTC+0 (格林威治): 0 * 3600  
-        // UTC-5 (美国东部): -5 * 3600
-        // UTC-8 (美国西部): -8 * 3600
-        configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");  // 设置中国时区(UTC+8)
+    
+    // 检查是否有保存的WiFi凭据
+    if (strlen(ssid) > 0 && strlen(password) > 0) {
+        Serial.println("检测到保存的WiFi凭据，尝试连接...");
+        connectWiFi();  // 启动非阻塞WiFi连接
         
-        // 等待NTP时间同步（非阻塞方式）
-        Serial.println("等待NTP时间同步...");
-        struct tm timeinfo;
-        int attempts = 0;
-        unsigned long ntpStartTime = millis();
-        while (!getLocalTime(&timeinfo, 10) && attempts < 10) {  // 设置10ms超时，避免阻塞
-            // 非阻塞等待1秒
-            unsigned long attemptStartTime = millis();
-            while (millis() - attemptStartTime < 1000) {
-                lv_timer_handler();  // 保持UI响应
-                lv_tick_inc(1);
-            }
-            attempts++;
-            Serial.printf("NTP同步尝试 %d/10\n", attempts);
-        }
-        
-        if (getLocalTime(&timeinfo, 10)) {  // 设置10ms超时，避免阻塞
-            Serial.println("NTP时间同步成功");
-            char timeStr[64];
-            strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
-            Serial.printf("当前时间: %s\n", timeStr);
-            
-            // 详细的时间调试信息
-            const char* weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
-            Serial.printf("详细时间信息:\n");
-            Serial.printf("  年份: %d\n", timeinfo.tm_year + 1900);
-            Serial.printf("  月份: %d\n", timeinfo.tm_mon + 1);
-            Serial.printf("  日期: %d\n", timeinfo.tm_mday);
-            Serial.printf("  星期: %s (tm_wday=%d)\n", weekdays[timeinfo.tm_wday], timeinfo.tm_wday);
-            Serial.printf("  时间: %02d:%02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-        } else {
-            Serial.println("NTP时间同步失败，使用默认时间");
-        }
-        
-        // 非阻塞延时2秒让用户看到"WiFi Connected"状态
-        unsigned long wifiConnectedTime = millis();
-        while (millis() - wifiConnectedTime < 2000) {
-            lv_timer_handler();  // 保持UI响应
-            lv_tick_inc(1);
-        }
-        
-        fetchGitHubData();  // 获取GitHub数据（会显示"Fetching data..."状态）
-        lastDataUpdate = millis();  // 记录数据更新时间
-        
-        // 获取天气数据
-        fetchWeatherData();  // 获取天气数据
-        lastWeatherUpdate = millis();  // 记录天气数据更新时间
+        // 注意：WiFi连接现在是非阻塞的，实际的连接成功处理将在主循环中的状态机中完成
+        // NTP时间同步和数据获取将在WiFi连接成功后自动触发
     } else {
-        // WiFi连接失败，提示用户进入设置
+        // 没有保存的WiFi凭据，提示用户进入设置
+        Serial.println("未找到保存的WiFi凭据");
         updateStatus("Configure WiFi in Settings", lv_color_hex(0xfbbf24));
     }
     
@@ -5108,6 +5214,7 @@ void setup() {
     lastTimeUpdate = millis();     // 时间显示更新定时器
     lastProgressUpdate = millis(); // 进度条更新定时器
     updateProgressBar();           // 初始化进度条显示
+    updateTimeDisplay();           // 初始化时间显示
     Serial.println("\n初始化完成！开始主循环...");
 }
 
@@ -5128,21 +5235,19 @@ void setup() {
  * 优化：优先处理LVGL以确保触摸响应，然后处理其他任务
  */
 void loop() {
+    // ===== 最高优先级：LVGL事件处理 =====
+    // 必须频繁调用以确保触摸和手势响应
+    lv_timer_handler();  // 处理LVGL事件，包括触摸和手势事件
+    lv_tick_inc(5);      // 增加LVGL内部时钟计数（提高精度）
+    
     // 获取当前时间戳，用于定时任务
     unsigned long currentMillis = millis();
     
-    // 静态变量声明，用于WiFi状态监控
-    static bool wasConnected = true;
-    
-    // ===== 优先处理LVGL，确保触摸响应 =====
-    // LVGL图形库必需的处理函数，处理UI事件、动画、触摸等
-    lv_timer_handler();  // 处理LVGL事件，包括触摸事件
-    lv_tick_inc(1);      // 增加LVGL内部时钟计数
-    // 移除阻塞式delay，使用非阻塞方式控制CPU占用
-    static unsigned long lastCpuControlTime = 0;
-    if (millis() - lastCpuControlTime >= 1) {
-        lastCpuControlTime = millis();
-        // 让出CPU时间片，避免占用过高
+    // ===== 高频率再次调用LVGL处理，确保手势识别 =====
+    static unsigned long lastLvglCall = 0;
+    if (currentMillis - lastLvglCall >= 5) {  // 每5ms再次调用
+        lv_timer_handler();
+        lastLvglCall = currentMillis;
     }
     
     // ===== 其他任务处理 =====
@@ -5175,8 +5280,15 @@ void loop() {
             show_message_box("Success", "WiFi connected successfully!\nSettings saved.");
             updateStatus("WiFi Connected", lv_color_hex(0x10b981));
             
-            // 立即获取GitHub数据
-            fetchGitHubData();
+            // 检查距离上次数据更新的时间，避免频繁重复获取
+            unsigned long timeSinceLastUpdate = currentMillis - lastDataUpdate;
+            if (timeSinceLastUpdate >= 30000 && !isFetchingData) {  // 至少间隔30秒
+                Serial.printf("[DEBUG] WiFi连接成功后获取数据，距离上次更新: %lu ms\n", timeSinceLastUpdate);
+                lastDataUpdate = currentMillis;  // 更新时间戳
+                fetchGitHubData();
+            } else {
+                Serial.printf("[DEBUG] WiFi连接成功但跳过数据获取，距离上次更新仅: %lu ms\n", timeSinceLastUpdate);
+            }
             
             // 如果来自密码输入界面，返回设置界面
             if (wifi_connect_from_password_screen) {
@@ -5220,8 +5332,67 @@ void loop() {
 
 
     // 处理WiFi网络扫描结果，更新WiFi列表界面
+    // 只有在WiFi列表界面时才处理扫描结果
+    if (lv_scr_act() == screen_wifi_list) {
+        // 在WiFi列表界面时处理扫描结果
+        processWiFiScanResults();
+    }
+    
+    // ===== 分时处理系统任务，避免阻塞LVGL =====
+    // 将系统任务分散到不同的时间片中执行
+    static unsigned long lastSystemTaskTime = 0;
+    static int systemTaskPhase = 0;
+    
+    if (currentMillis - lastSystemTaskTime >= 50) {  // 每50ms执行一个阶段的系统任务
+        switch (systemTaskPhase) {
+            case 0:
+                // 阶段0：处理更新成功状态和重试机制
+                processUpdateAndRetry(currentMillis);
+                break;
+            case 1:
+                // 阶段1：处理定时数据获取
+                processDataFetching(currentMillis);
+                break;
+            case 2:
+                // 阶段2：处理时间和进度条更新
+                processTimeAndProgress(currentMillis);
+                break;
+            case 3:
+                // 阶段3：处理WiFi状态监控
+                processWiFiMonitoring(currentMillis);
+                break;
+        }
+        
+        systemTaskPhase = (systemTaskPhase + 1) % 4;  // 循环执行4个阶段
+        lastSystemTaskTime = currentMillis;
+    }
+    
+    // 短暂延时，让出CPU时间
+    delayMicroseconds(100);  // 使用微秒级延时，减少对LVGL的影响
+}
+
+// 处理WiFi扫描结果的独立函数
+void processWiFiScanResults() {
+    // 如果扫描已经成功完成，跳过后续的扫描状态检查
+    if (wifi_scan_completed_once) {
+        // 扫描已成功，不再检查扫描状态，避免重复处理
+        return;
+    }
+    
     int n = WiFi.scanComplete();
     if (n >= 0) {
+        // 防止重复处理同一个扫描结果
+        unsigned long current_time = millis();
+        
+        // 如果是相同的扫描结果且时间间隔很短，跳过处理
+        if (n == last_processed_scan_result && current_time - last_scan_process_time < 1000) {
+            return;
+        }
+        
+        // 更新处理记录
+        last_processed_scan_result = n;
+        last_scan_process_time = current_time;
+        
         // WiFi扫描已完成，处理扫描结果
         Serial.printf("WiFi扫描完成，找到 %d 个网络\n", n);
         lv_obj_t* list = lv_obj_get_child(screen_wifi_list, 1);   // 获取WiFi列表控件
@@ -5234,6 +5405,12 @@ void loop() {
             Serial.println("未找到WiFi网络");
             lv_label_set_text(label, "No networks found.");
             lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);  // 显示"未找到网络"提示
+            
+            // 删除扫描结果并重置状态
+            WiFi.scanDelete();
+            wifi_scan_in_progress = false;
+            last_processed_scan_result = -1;
+            Serial.println("[WIFI] 未找到网络，清理扫描结果并重置状态");
         } else {
             // 找到WiFi网络，添加到列表中
             Serial.printf("WiFi扫描成功！找到 %d 个网络，添加到列表:\n", n);
@@ -5292,16 +5469,13 @@ void loop() {
         wifi_scan_completed_once = true;
         Serial.println("[WIFI] 设置扫描完成标志，后续将跳过自动扫描");
         
-        // 设置扫描成功时间戳，用于虚假失败事件检测
-        wifi_scan_success_time = millis();
-        Serial.println("[WIFI] 设置扫描成功时间戳，启用虚假失败事件检测");
+        // 扫描成功，保留结果，不调用scanDelete()避免触发虚假失败事件
+        Serial.println("[WIFI] 扫描成功，保留扫描结果，避免虚假失败事件");
         
-        // 扫描成功后不立即删除结果，保留供用户选择网络
-        // WiFi.scanDelete(); // 注释掉：扫描成功后不应该立即删除结果
-        
-        // 重置扫描状态但保留扫描结果
+        // 重置扫描状态，但保留重复处理保护变量
         wifi_scan_in_progress = false;
-        Serial.println("WiFi扫描结果处理完成，状态已重置（保留扫描结果）");
+        // 不重置last_processed_scan_result，保持重复处理保护
+        Serial.println("WiFi扫描结果处理完成，状态已重置");
         }
     } else if (n == WIFI_SCAN_RUNNING) {
         // WiFi扫描仍在进行中，提供详细的进度监控
@@ -5342,49 +5516,10 @@ void loop() {
         static unsigned long lastFailureTime = 0;
         unsigned long currentTime = millis();
         
-        // 检查是否是扫描成功后scanDelete()引起的虚假失败事件
-        static unsigned long ignore_window = 5000;  // 动态调整的忽略窗口时间
-        static bool ignore_detection_disabled = false;  // 虚假事件检测禁用标志
-        
-        if (wifi_scan_success_time > 0 && currentTime - wifi_scan_success_time < ignore_window && !ignore_detection_disabled) {
-            static int ignore_count = 0;
-            static unsigned long last_ignore_reset = 0;
-            
-            // 每60秒重置一次计数器，避免无限累加
-            if (currentTime - last_ignore_reset > 60000) {
-                // 如果虚假事件过多，考虑暂时禁用检测
-                if (ignore_count > 500) {
-                    ignore_detection_disabled = true;
-                    Serial.println("[WIFI] 虚假事件过多，暂时禁用虚假失败事件检测");
-                } else if (ignore_count > 100) {
-                    ignore_window = min(ignore_window + 1000, 10000UL);  // 最大10秒
-                    Serial.printf("[WIFI] 虚假事件过多，延长忽略窗口至%lu毫秒\n", ignore_window);
-                }
-                ignore_count = 0;
-                last_ignore_reset = currentTime;
-                Serial.println("[WIFI] 重置虚假失败事件计数器");
-            }
-            
-            ignore_count++;
-            // 优化日志输出：前3次记录，之后每100次记录一次，进一步减少日志噪音
-            if (ignore_count <= 3 || ignore_count % 100 == 0) {
-                Serial.printf("[WIFI] 忽略虚假失败事件 (第%d次)\n", ignore_count);
-            }
-            return;
-        } else if (wifi_scan_success_time > 0) {
-            // 超过忽略窗口时间后重置成功时间标记，允许处理真实的失败事件
-            wifi_scan_success_time = 0;
-            // 逐渐恢复忽略窗口时间到默认值
-            if (ignore_window > 5000) {
-                ignore_window = max(ignore_window - 500, 5000UL);
-                Serial.printf("[WIFI] 恢复忽略窗口至%lu毫秒\n", ignore_window);
-            }
-            // 重新启用虚假事件检测
-            if (ignore_detection_disabled) {
-                ignore_detection_disabled = false;
-                Serial.println("[WIFI] 重新启用虚假失败事件检测");
-            }
-            Serial.println("[WIFI] 重置虚假失败事件检测标记");
+        // 简化的失败事件处理：如果扫描已经成功过，忽略后续失败事件
+        if (wifi_scan_completed_once) {
+            Serial.println("[WIFI] 扫描已成功，忽略后续失败事件，保留扫描结果");
+            return;  // 直接返回，不处理任何失败事件
         }
         
         if (currentTime - lastFailureTime < 1000) {
@@ -5465,7 +5600,13 @@ void loop() {
         WiFi.scanDelete();
         wifi_scan_in_progress = false;
     }
+}
 
+/**
+ * 处理更新成功状态和重试机制
+ * 参数：currentMillis - 当前时间戳
+ */
+void processUpdateAndRetry(unsigned long currentMillis) {
     // 处理"更新成功"状态显示的超时（显示3秒后恢复正常状态）
     if (showingUpdateSuccess && currentMillis - updateSuccessTime >= SUCCESS_DISPLAY_TIME) {
         showingUpdateSuccess = false;
@@ -5478,17 +5619,172 @@ void loop() {
     
     // 处理重试机制（当HTTP错误码为-1时，10秒后重新获取数据）
     if (waitingForRetry && currentMillis >= retryTime) {
-        Serial.println("[DEBUG] 重试时间到，重新获取GitHub数据");
+        Serial.println("[DEBUG] 重试时间到，检查是否需要重新获取GitHub数据");
         waitingForRetry = false;
         if (WiFi.status() == WL_CONNECTED && !isFetchingData) {
-            fetchGitHubData();
+            // 检查距离上次数据更新的时间，避免频繁重复获取
+            unsigned long timeSinceLastUpdate = currentMillis - lastDataUpdate;
+            if (timeSinceLastUpdate >= 10000) {  // 至少间隔10秒
+                Serial.printf("[DEBUG] 重试获取数据，距离上次更新: %lu ms\n", timeSinceLastUpdate);
+                lastDataUpdate = currentMillis;  // 更新时间戳
+                fetchGitHubData();
+            } else {
+                Serial.printf("[DEBUG] 重试跳过数据获取，距离上次更新仅: %lu ms\n", timeSinceLastUpdate);
+            }
+        }
+    }
+}
+
+/**
+ * 处理定时数据获取
+ * 参数：currentMillis - 当前时间戳
+ */
+void processDataFetching(unsigned long currentMillis) {
+    // 定时获取GitHub数据（每5分钟更新一次，仅在WiFi连接时执行）
+    if (WiFi.status() == WL_CONNECTED && currentMillis - lastDataUpdate >= UPDATE_INTERVAL && !isFetchingData) {
+        Serial.printf("[DEBUG] 定时器触发GitHub数据获取，距离上次更新: %lu ms\n", currentMillis - lastDataUpdate);
+        lastDataUpdate = currentMillis;  // 立即更新时间戳，防止重复触发
+        fetchGitHubData();           // 获取最新的GitHub仓库数据
+    }
+    
+    // 定时获取天气数据（每10分钟更新一次，仅在WiFi连接时执行）
+    if (WiFi.status() == WL_CONNECTED && currentMillis - lastWeatherUpdate >= WEATHER_UPDATE_INTERVAL) {
+        Serial.println("定时更新天气数据");
+        fetchWeatherData();          // 获取最新的天气数据
+        lastWeatherUpdate = currentMillis;  // 更新最后天气数据获取时间
+    }
+}
+
+/**
+ * 处理时间和进度条更新
+ * 参数：currentMillis - 当前时间戳
+ */
+void processTimeAndProgress(unsigned long currentMillis) {
+    // 定时更新当前时间显示（每秒更新一次）
+    static unsigned long lastCurrentTimeUpdate = 0;
+    if (currentMillis - lastCurrentTimeUpdate >= 1000) {
+        updateCurrentTimeDisplay();  // 更新标题下方的实时时间显示
+        lastCurrentTimeUpdate = currentMillis;
+    }
+    
+    // 定时更新时间显示（每分钟更新一次"Last Upd"信息）
+    if (currentMillis - lastTimeUpdate >= TIME_UPDATE_INTERVAL) {
+        if (!showingUpdateSuccess && !isFetchingData) { 
+            showCurrentTime();   // 显示当前系统时间（如果不在显示更新成功状态且不在获取数据）
+        }
+        updateTimeDisplay();     // 更新"Last Upd"时间显示
+        checkAndSaveDailyData(); // 检查并保存每日数据
+        lastTimeUpdate = currentMillis;
+    }
+    
+    // 定时更新进度条（手动刷新时每100ms更新一次，正常时每1秒更新一次）
+    unsigned long progressUpdateInterval = isManualRefreshing ? 100 : 1000;
+    if (currentMillis - lastProgressUpdate >= progressUpdateInterval) {
+        updateProgressBar();
+        lastProgressUpdate = currentMillis;
+    }
+}
+
+/**
+ * 处理WiFi状态监控
+ * 参数：currentMillis - 当前时间戳
+ */
+void processWiFiMonitoring(unsigned long currentMillis) {
+    static bool wasConnected = true;
+    
+    // WiFi连接状态监控和异常处理
+    static unsigned long lastWiFiCheck = 0;
+    bool currentlyConnected = (WiFi.status() == WL_CONNECTED);
+    
+    // 每30秒检查一次WiFi连接状态
+    if (currentMillis - lastWiFiCheck > 30000) {
+        if (!currentlyConnected && !isFetchingData && !networkErrorShowing) {
+            updateStatus("WiFi Disconnected", lv_color_hex(0xef4444));  // 显示WiFi断开提示
+            // 显示网络错误提示框，引导用户去设置
+            show_network_error_message_box("Network Error", "WiFi connection lost.\nPlease check your network settings.\nTap OK to go to Settings.");
+        }
+        lastWiFiCheck = currentMillis;
+    }
+    
+    // 检测WiFi状态变化：从断开到连接（包括首次连接和重新连接）
+    if (!wasConnected && currentlyConnected) {
+        Serial.println("[DEBUG] 检测到WiFi连接成功");
+        // WiFi连接后，重置所有相关状态
+        showingUpdateSuccess = false; // 清除更新成功状态
+        updateSuccessTime = 0;       // 重置更新成功时间
+        networkErrorShowing = false; // 重置网络错误状态，允许再次显示错误消息框
+        
+        // 检查是否是首次连接（lastDataUpdate为0表示从未获取过数据）
+        if (lastDataUpdate == 0) {
+            Serial.println("[DEBUG] 首次WiFi连接，立即开始数据获取");
+            lastDataUpdate = currentMillis;  // 设置初始时间戳，启动进度条显示
+            fetchGitHubData();  // 立即获取GitHub数据
+            
+            // 同时获取天气数据
+            lastWeatherUpdate = currentMillis;
+            fetchWeatherData();
+        } else {
+            // 重新连接的情况，检查距离上次数据更新的时间
+            unsigned long timeSinceLastUpdate = currentMillis - lastDataUpdate;
+            if (timeSinceLastUpdate >= 60000 && !isFetchingData) {  // 至少间隔1分钟
+                Serial.printf("[DEBUG] WiFi重连后获取数据，距离上次更新: %lu ms\n", timeSinceLastUpdate);
+                lastDataUpdate = currentMillis;  // 更新时间戳
+                fetchGitHubData();
+            } else {
+                Serial.printf("[DEBUG] WiFi重连但跳过数据获取，距离上次更新仅: %lu ms\n", timeSinceLastUpdate);
+            }
+            
+            // 天气数据更新逻辑
+            unsigned long timeSinceLastWeatherUpdate = currentMillis - lastWeatherUpdate;
+            if (timeSinceLastWeatherUpdate >= 60000) {  // 至少间隔1分钟
+                lastWeatherUpdate = currentMillis;
+                fetchWeatherData();
+            }
+        }
+        
+        Serial.println("WiFi连接处理完成，状态已重置");
+    }
+    
+    wasConnected = currentlyConnected;  // 保存当前连接状态，用于下次比较
+}
+
+// 处理系统任务的独立函数（已废弃，保留用于兼容性）
+void processSystemTasks(unsigned long currentMillis) {
+    // 静态变量声明，用于WiFi状态监控
+    static bool wasConnected = true;
+    
+    // 处理"更新成功"状态显示的超时（显示3秒后恢复正常状态）
+    if (showingUpdateSuccess && currentMillis - updateSuccessTime >= SUCCESS_DISPLAY_TIME) {
+        showingUpdateSuccess = false;
+        if (!isFetchingData) {
+            showCurrentTime();     // 恢复显示当前时间（如果不在获取数据）
+        }
+        updateProgressBar();   // 恢复进度条正常显示
+        updateTimeDisplay();   // 立即更新时间显示为<1min
+    }
+    
+    // 处理重试机制（当HTTP错误码为-1时，10秒后重新获取数据）
+    if (waitingForRetry && currentMillis >= retryTime) {
+        Serial.println("[DEBUG] 重试时间到，检查是否需要重新获取GitHub数据");
+        waitingForRetry = false;
+        if (WiFi.status() == WL_CONNECTED && !isFetchingData) {
+            // 检查距离上次数据更新的时间，避免频繁重复获取
+            unsigned long timeSinceLastUpdate = currentMillis - lastDataUpdate;
+            if (timeSinceLastUpdate >= 10000) {  // 至少间隔10秒
+                Serial.printf("[DEBUG] 重试获取数据，距离上次更新: %lu ms\n", timeSinceLastUpdate);
+                lastDataUpdate = currentMillis;  // 更新时间戳
+                fetchGitHubData();
+            } else {
+                Serial.printf("[DEBUG] 重试跳过数据获取，距离上次更新仅: %lu ms\n", timeSinceLastUpdate);
+            }
         }
     }
     
-    // 定时获取GitHub数据（每30分钟更新一次，仅在WiFi连接时执行）
-    if (WiFi.status() == WL_CONNECTED && currentMillis - lastDataUpdate >= UPDATE_INTERVAL) {
+    // 定时获取GitHub数据（每5分钟更新一次，仅在WiFi连接时执行）
+    if (WiFi.status() == WL_CONNECTED && currentMillis - lastDataUpdate >= UPDATE_INTERVAL && !isFetchingData) {
+        Serial.printf("[DEBUG] 定时器触发GitHub数据获取，距离上次更新: %lu ms\n", currentMillis - lastDataUpdate);
+        lastDataUpdate = currentMillis;  // 立即更新时间戳，防止重复触发
         fetchGitHubData();           // 获取最新的GitHub仓库数据
-        lastDataUpdate = currentMillis;  // 更新最后数据获取时间
     }
     
     // 定时获取天气数据（每10分钟更新一次，仅在WiFi连接时执行）
@@ -5499,16 +5795,17 @@ void loop() {
     }
     
     // 检查是否需要在特定时间自动刷新天气数据（早上8点、中午12点、晚上6点）
+    // 降低检查频率，避免频繁调用getLocalTime阻塞LVGL
     static unsigned long lastWeatherTimeCheck = 0;
-    if (WiFi.status() == WL_CONNECTED && currentMillis - lastWeatherTimeCheck >= 60000) { // 每分钟检查一次
+    if (WiFi.status() == WL_CONNECTED && currentMillis - lastWeatherTimeCheck >= 300000) { // 每5分钟检查一次，减少频率
         struct tm timeinfo;
-        // 使用非阻塞方式获取时间，避免阻塞LVGL事件处理
-        if (getLocalTime(&timeinfo, 10)) {  // 设置10ms超时，避免长时间阻塞
+        // 使用更短的超时时间，减少阻塞
+        if (getLocalTime(&timeinfo, 5)) {  // 设置5ms超时，进一步减少阻塞
             int currentHour = timeinfo.tm_hour;
             int currentMinute = timeinfo.tm_min;
             
             // 检查是否是指定的刷新时间（8:00, 12:00, 18:00）
-            if ((currentHour == 8 || currentHour == 12 || currentHour == 18) && currentMinute == 0) {
+            if ((currentHour == 8 || currentHour == 12 || currentHour == 18) && currentMinute < 5) { // 扩大时间窗口
                 // 检查是否已经在这个小时内刷新过（避免重复刷新）
                 static int lastAutoRefreshHour = -1;
                 if (lastAutoRefreshHour != currentHour) {
@@ -5524,7 +5821,7 @@ void loop() {
                 }
             }
         } else {
-            Serial.println("[TIME] getLocalTime超时，跳过时间检查以避免阻塞LVGL");
+            // 静默跳过，避免频繁打印日志
         }
         lastWeatherTimeCheck = currentMillis;
     }
@@ -5568,18 +5865,43 @@ void loop() {
         lastWiFiCheck = currentMillis;
     }
     
-    // 检测WiFi状态变化：从断开到重新连接
+    // 检测WiFi状态变化：从断开到连接（包括首次连接和重新连接）
     if (!wasConnected && currentlyConnected) {
-        // WiFi重新连接后，重置所有相关状态
-        lastDataUpdate = 0;          // 重置数据更新时间，触发立即更新
-        lastWeatherUpdate = 0;     // 重置天气数据更新时间，触发立即更新
+        Serial.println("[DEBUG] 检测到WiFi连接成功");
+        // WiFi连接后，重置所有相关状态
         showingUpdateSuccess = false; // 清除更新成功状态
         updateSuccessTime = 0;       // 重置更新成功时间
         networkErrorShowing = false; // 重置网络错误状态，允许再次显示错误消息框
-        // 立即更新显示界面
-        fetchGitHubData();
-        fetchWeatherData();          // 获取天气数据
-        Serial.println("WiFi重新连接，状态已重置");
+        
+        // 检查是否是首次连接（lastDataUpdate为0表示从未获取过数据）
+        if (lastDataUpdate == 0) {
+            Serial.println("[DEBUG] 首次WiFi连接，立即开始数据获取");
+            lastDataUpdate = currentMillis;  // 设置初始时间戳，启动进度条显示
+            fetchGitHubData();  // 立即获取GitHub数据
+            
+            // 同时获取天气数据
+            lastWeatherUpdate = currentMillis;
+            fetchWeatherData();
+        } else {
+            // 重新连接的情况，检查距离上次数据更新的时间
+            unsigned long timeSinceLastUpdate = currentMillis - lastDataUpdate;
+            if (timeSinceLastUpdate >= 60000 && !isFetchingData) {  // 至少间隔1分钟
+                Serial.printf("[DEBUG] WiFi重连后获取数据，距离上次更新: %lu ms\n", timeSinceLastUpdate);
+                lastDataUpdate = currentMillis;  // 更新时间戳
+                fetchGitHubData();
+            } else {
+                Serial.printf("[DEBUG] WiFi重连但跳过数据获取，距离上次更新仅: %lu ms\n", timeSinceLastUpdate);
+            }
+            
+            // 天气数据更新逻辑
+            unsigned long timeSinceLastWeatherUpdate = currentMillis - lastWeatherUpdate;
+            if (timeSinceLastWeatherUpdate >= 60000) {  // 至少间隔1分钟
+                lastWeatherUpdate = currentMillis;
+                fetchWeatherData();
+            }
+        }
+        
+        Serial.println("WiFi连接处理完成，状态已重置");
     }
     
     wasConnected = currentlyConnected;  // 保存当前连接状态，用于下次比较
@@ -6099,14 +6421,15 @@ void updateChartDisplay() {
 }
 
 /**
- * 星星卡片长按事件回调函数
- * 功能：处理星星卡片的长按事件，切换到图表界面
+ * 星星卡片事件回调函数
+ * 功能：处理星星卡片的长按事件
+ * 长按3秒后进入图表界面
  */
 static void stars_card_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     
     if (code == LV_EVENT_LONG_PRESSED) {
-        Serial.println("星星卡片被长按，切换到图表界面");
+        Serial.println("星星卡片被长按3秒，切换到图表界面");
         
         // 创建图表界面（如果尚未创建）
         if (screen_chart == NULL) {
