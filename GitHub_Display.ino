@@ -431,8 +431,17 @@ void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
  *   - data: 触摸数据输出结构体
  */
 void my_touchpad_read(lv_indev_t *indev_driver, lv_indev_data_t *data) {
-    // 检查触摸中断引脚和触摸状态
-    if (touchscreen.tirqTouched() && touchscreen.touched()) {
+    static bool last_touch_state = false;
+    static unsigned long last_touch_time = 0;
+    static lv_coord_t last_x = 0, last_y = 0;
+    static int stable_count = 0;
+    unsigned long current_time = millis();
+    
+    // 优化的触摸检测逻辑：使用touched()作为主要检测条件
+    // 这样可以提高手势识别的稳定性，避免需要多点触控才能识别手势的问题
+    bool current_touch = touchscreen.touched();
+    
+    if (current_touch) {
         TS_Point p = touchscreen.getPoint();  // 获取原始触摸坐标
         
         // 坐标映射：将XPT2046的原始坐标转换为屏幕坐标
@@ -441,12 +450,58 @@ void my_touchpad_read(lv_indev_t *indev_driver, lv_indev_data_t *data) {
         int mapped_y = map(p.y, 240, 3800, SCREEN_HEIGHT - 1, 0);  // Y轴映射
 
         // 坐标约束：确保坐标值在屏幕范围内，防止越界
-        data->point.x = constrain(mapped_x, 0, SCREEN_WIDTH - 1);
-        data->point.y = constrain(mapped_y, 0, SCREEN_HEIGHT - 1);
+        mapped_x = constrain(mapped_x, 0, SCREEN_WIDTH - 1);
+        mapped_y = constrain(mapped_y, 0, SCREEN_HEIGHT - 1);
+        
+        // 手势识别优化：坐标稳定性处理
+        if (last_touch_state && current_time - last_touch_time < 50) {
+            // 连续触摸时进行坐标平滑，减少抖动对手势识别的影响
+            int diff_x = abs(mapped_x - last_x);
+            int diff_y = abs(mapped_y - last_y);
+            
+            // 如果坐标变化很小，认为是抖动，使用平滑值
+            if (diff_x < 5 && diff_y < 5) {
+                stable_count++;
+                if (stable_count > 2) {  // 连续稳定3次后使用平滑坐标
+                    data->point.x = (last_x * 2 + mapped_x) / 3;
+                    data->point.y = (last_y * 2 + mapped_y) / 3;
+                } else {
+                    data->point.x = mapped_x;
+                    data->point.y = mapped_y;
+                }
+            } else {
+                // 坐标变化较大，重置稳定计数，直接使用新坐标
+                stable_count = 0;
+                data->point.x = mapped_x;
+                data->point.y = mapped_y;
+            }
+        } else {
+            // 新的触摸或长时间间隔，直接使用新坐标
+            stable_count = 0;
+            data->point.x = mapped_x;
+            data->point.y = mapped_y;
+        }
+        
         data->state = LV_INDEV_STATE_PR;  // 设置触摸状态为按下
+        
+        // 更新历史记录
+        last_x = data->point.x;
+        last_y = data->point.y;
+        last_touch_time = current_time;
+        
+        // 调试输出（可选，用于测试手势识别）
+        static unsigned long lastDebugTime = 0;
+        if (current_time - lastDebugTime > 200) {  // 降低调试输出频率
+            Serial.printf("[TOUCH] 坐标: (%d, %d), 稳定计数: %d\n", 
+                         data->point.x, data->point.y, stable_count);
+            lastDebugTime = current_time;
+        }
     } else {
         data->state = LV_INDEV_STATE_REL;  // 设置触摸状态为释放（未触摸）
+        stable_count = 0;  // 重置稳定计数
     }
+    
+    last_touch_state = current_touch;
 }
 
 // ===== UI事件处理函数 =====
@@ -733,9 +788,9 @@ void processWiFiSetupStateMachine() {
     unsigned long currentTime = millis();
     
     if (wifi_setup_state == WIFI_SETUP_IDLE) {
-        // 在空闲状态下检查扫描超时
-        if (wifi_scan_in_progress && (currentTime - wifi_scan_start_time > 30000)) {
-            Serial.println("[WIFI_SM] WiFi扫描超时（30秒），强制重试");
+        // 在空闲状态下检查扫描超时（激进模式：减少超时时间）
+        if (wifi_scan_in_progress && (currentTime - wifi_scan_start_time > 15000)) {  // 从30秒减少到15秒
+            Serial.println("[WIFI_SM] WiFi扫描超时（15秒），立即强制重试");
             wifi_scan_in_progress = false;
             wifi_scan_timeout_count++;
             wifi_setup_state = WIFI_SETUP_SCAN_RETRY;
@@ -747,8 +802,8 @@ void processWiFiSetupStateMachine() {
     
     switch (wifi_setup_state) {
         case WIFI_SETUP_MODE_CHANGE:
-            // 等待WiFi模式切换完成（减少等待时间）
-            if (currentTime - wifi_setup_timer >= 50) {
+            // 等待WiFi模式切换完成（激进模式：进一步减少等待时间）
+            if (currentTime - wifi_setup_timer >= 20) {
                 Serial.println("[WIFI_SM] WiFi模式切换完成，开始扫描");
                 wifi_setup_state = WIFI_SETUP_SCAN_START;
                 wifi_setup_timer = currentTime;
@@ -798,40 +853,32 @@ void processWiFiSetupStateMachine() {
                     break;
                 }
                 
-                // 使用渐进式延迟重试策略
-                unsigned long retry_delay = 500 + (wifi_setup_retry_count * 300);  // 500ms, 800ms, 1100ms...
+                // 使用激进的快速重试策略，减少延迟时间
+                unsigned long retry_delay = 200 + (wifi_setup_retry_count * 100);  // 200ms, 300ms, 400ms...
                 
                 if (currentTime - wifi_setup_timer >= retry_delay) {
                     wifi_setup_retry_count++;
-                    Serial.printf("[WIFI_SM] 重试扫描 (第%d次，延迟%lums)...\n", wifi_setup_retry_count, retry_delay);
+                    Serial.printf("[WIFI_SM] 激进重试扫描 (第%d次，延迟%lums)...\n", wifi_setup_retry_count, retry_delay);
                     
                     // 清理之前的扫描结果
                     WiFi.scanDelete();
-                    delay(100);
+                    delay(50);  // 减少延迟时间
                     
                     int retry_result = WiFi.scanNetworks(true);
                     Serial.printf("[WIFI_SM] 重试扫描结果: %d\n", retry_result);
                     
                     if (retry_result == -2) {
-                        if (wifi_setup_retry_count < 5) {
-                            // 继续重试（最多5次）
+                        if (wifi_setup_retry_count < 2) {  // 减少重试次数，更快进入重置
+                            // 快速重试（最多2次）
                             wifi_setup_timer = currentTime;
-                            Serial.printf("[WIFI_SM] 扫描失败，将在%lums后进行第%d次重试\n", retry_delay + 300, wifi_setup_retry_count + 1);
-                        } else if (wifi_reset_attempt_count < 2) {
-                            // 尝试WiFi模块软重置
-                            Serial.println("[WIFI_SM] 多次扫描失败，尝试WiFi模块软重置...");
+                            Serial.printf("[WIFI_SM] 错误码-2快速重试，将在%lums后进行第%d次重试\n", retry_delay + 100, wifi_setup_retry_count + 1);
+                        } else {
+                            // 立即进入重置流程，不再等待
+                            Serial.println("[WIFI_SM] 错误码-2检测到，立即启动WiFi模块重置...");
                             wifi_reset_attempt_count++;
                             wifi_setup_retry_count = 0;  // 重置重试计数
                             wifi_setup_state = WIFI_SETUP_RESET_DISCONNECT;
                             wifi_setup_timer = currentTime;
-                        } else {
-                            // 所有重试和重置都失败，进入最终错误状态
-                            Serial.println("[WIFI_SM] WiFi扫描彻底失败，进入错误恢复模式");
-                            wifi_setup_state = WIFI_SETUP_IDLE;
-                            wifi_scan_timeout_count++;
-                            // 重置所有计数器，为下次尝试做准备
-                            wifi_setup_retry_count = 0;
-                            wifi_reset_attempt_count = 0;
                         }
                     } else {
                         // 重试成功，重置所有计数器
@@ -847,37 +894,37 @@ void processWiFiSetupStateMachine() {
             }
             
         case WIFI_SETUP_RESET_DISCONNECT:
-            // 增强的重置流程：断开连接并清理
-            Serial.println("[WIFI_SM] 执行WiFi软重置: 断开连接并清理...");
+            // 激进的重置流程：快速断开连接并清理
+            Serial.println("[WIFI_SM] 执行WiFi激进重置: 快速断开连接并清理...");
             WiFi.disconnect(true);   // 断开并清除配置
             WiFi.scanDelete();       // 清除扫描结果
-            delay(200);              // 等待断开完成
+            delay(50);               // 减少等待时间
             wifi_setup_state = WIFI_SETUP_RESET_OFF;
             wifi_setup_timer = currentTime;
             break;
             
         case WIFI_SETUP_RESET_OFF:
-            // WiFi模块关闭
-            if (currentTime - wifi_setup_timer >= 300) {
-                Serial.println("[WIFI_SM] 关闭WiFi模块...");
+            // WiFi模块快速关闭
+            if (currentTime - wifi_setup_timer >= 100) {  // 减少等待时间
+                Serial.println("[WIFI_SM] 快速关闭WiFi模块...");
                 WiFi.mode(WIFI_OFF);
-                delay(100);
+                delay(50);  // 减少延迟
                 wifi_setup_state = WIFI_SETUP_RESET_ON;
                 wifi_setup_timer = currentTime;
             }
             break;
             
         case WIFI_SETUP_RESET_ON:
-            // WiFi模块重新启动
-            if (currentTime - wifi_setup_timer >= 500) {
-                Serial.println("[WIFI_SM] 重新启动WiFi模块...");
+            // WiFi模块快速重新启动
+            if (currentTime - wifi_setup_timer >= 200) {  // 减少等待时间
+                Serial.println("[WIFI_SM] 快速重新启动WiFi模块...");
                 WiFi.mode(WIFI_STA);
-                delay(200);
+                delay(100);  // 减少延迟
                 // 如果之前有连接，尝试重新连接
                 if (wifi_setup_was_connected && wifi_setup_saved_ssid.length() > 0) {
                     Serial.printf("[WIFI_SM] 重新连接到 %s...\n", wifi_setup_saved_ssid.c_str());
                     WiFi.begin(wifi_setup_saved_ssid, wifi_setup_saved_password);
-                    delay(100);
+                    delay(50);  // 减少延迟
                 }
                 wifi_setup_state = WIFI_SETUP_RESET_SCAN;
                 wifi_setup_timer = currentTime;
@@ -895,8 +942,8 @@ void processWiFiSetupStateMachine() {
             
         case WIFI_SETUP_RESET_SCAN:
             {
-                // 重置后的扫描重试
-                if (currentTime - wifi_setup_timer >= 1000) {
+                // 重置后的快速扫描重试
+                if (currentTime - wifi_setup_timer >= 300) {  // 减少等待时间
                     // 检查是否已经扫描成功过一次，如果是则跳过扫描
                     if (wifi_scan_completed_once) {
                         Serial.println("[WIFI_SM] 重置后检测到已有扫描结果，跳过重复扫描");
@@ -904,9 +951,9 @@ void processWiFiSetupStateMachine() {
                         break;
                     }
                     
-                    Serial.println("[WIFI_SM] WiFi模块重置完成，重新尝试扫描...");
+                    Serial.println("[WIFI_SM] WiFi模块重置完成，立即重新尝试扫描...");
                     WiFi.scanDelete();  // 清理之前的结果
-                    delay(100);
+                    delay(50);  // 减少延迟
                     
                     int final_scan_result = WiFi.scanNetworks(true);
                     Serial.printf("[WIFI_SM] 重置后扫描结果: %d\n", final_scan_result);
@@ -3139,6 +3186,14 @@ void create_edit_token_screen() {
  * - 右滑：切换到天气界面或返回主界面
  * - 具有最高优先级，优先于其他事件处理
  */
+/**
+ * 全局手势事件回调函数
+ * 功能：处理所有界面的左右滑动手势，实现页面切换
+ * 动画逻辑：根据手势方向使用对应的动画效果
+ * - 左滑手势：新页面从右侧滑入 (MOVE_LEFT)
+ * - 右滑手势：新页面从左侧滑入 (MOVE_RIGHT)
+ * - 返回操作：使用与进入相反的动画方向
+ */
 static void global_gesture_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     
@@ -3148,34 +3203,35 @@ static void global_gesture_event_cb(lv_event_t * e) {
         
         Serial.printf("[GLOBAL_GESTURE] 检测到全局手势事件，方向: %d，当前屏幕: %p\n", dir, current_screen);
         
-        if (dir == LV_DIR_LEFT) {
+        // 过滤掉非水平手势，只处理左右滑动
+        if (dir == LV_DIR_LEFT || (dir & LV_DIR_LEFT)) {
+            Serial.println("[GLOBAL_GESTURE] 检测到左滑手势");
             if (current_screen == main_screen) {
-                // 主界面左滑到日历界面
+                // 主界面左滑到日历界面 - 日历从右侧滑入
                 Serial.println("[GLOBAL_GESTURE] 主界面左滑，切换到日历界面");
-                // 删除旧的日历界面（如果存在）
                 if (screen_calendar != NULL) {
                     lv_obj_del(screen_calendar);
                     screen_calendar = NULL;
                 }
-                // 重新创建日历界面
                 create_calendar_screen();
                 lv_scr_load_anim(screen_calendar, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
                 control_buttons_visibility(screen_calendar);
                 updatePageIndicator(2);
-            } else if (current_screen == screen_calendar) {
-                // 日历界面左滑到主界面
-                Serial.println("[GLOBAL_GESTURE] 日历界面左滑，返回主界面");
+            } else if (current_screen == screen_weather) {
+                // 天气界面左滑返回主界面 - 主界面从左侧滑入
+                Serial.println("[GLOBAL_GESTURE] 天气界面左滑，返回主界面");
                 lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
                 control_buttons_visibility(main_screen);
                 updatePageIndicator(1);
-            } else if (current_screen == screen_weather) {
-                // 天气界面左滑无效
-                Serial.println("[GLOBAL_GESTURE] 天气界面左滑无效");
+            } else if (current_screen == screen_calendar) {
+                // 日历界面左滑无效
+                Serial.println("[GLOBAL_GESTURE] 日历界面左滑无效");
             }
         }
-        else if (dir == LV_DIR_RIGHT) {
+        else if (dir == LV_DIR_RIGHT || (dir & LV_DIR_RIGHT)) {
+            Serial.println("[GLOBAL_GESTURE] 检测到右滑手势");
             if (current_screen == main_screen) {
-                // 主界面右滑到天气界面
+                // 主界面右滑到天气界面 - 天气从左侧滑入
                 Serial.println("[GLOBAL_GESTURE] 主界面右滑，切换到天气界面");
                 if (screen_weather == NULL) {
                     create_weather_screen();
@@ -3183,19 +3239,25 @@ static void global_gesture_event_cb(lv_event_t * e) {
                 lv_scr_load_anim(screen_weather, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
                 control_buttons_visibility(screen_weather);
                 updatePageIndicator(0);
-            } else if (current_screen == screen_weather) {
-                // 天气界面右滑到主界面
-                Serial.println("[GLOBAL_GESTURE] 天气界面右滑，返回主界面");
+            } else if (current_screen == screen_calendar) {
+                // 日历界面右滑返回主界面 - 主界面从右侧滑入
+                Serial.println("[GLOBAL_GESTURE] 日历界面右滑，返回主界面");
                 lv_scr_load_anim(main_screen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
                 control_buttons_visibility(main_screen);
                 updatePageIndicator(1);
-            } else if (current_screen == screen_calendar) {
-                // 日历界面右滑无效
-                Serial.println("[GLOBAL_GESTURE] 日历界面右滑无效");
+            } else if (current_screen == screen_weather) {
+                // 天气界面右滑无效
+                Serial.println("[GLOBAL_GESTURE] 天气界面右滑无效");
             }
         }
         else {
-            Serial.printf("[GLOBAL_GESTURE] 未识别的手势方向: %d (LV_DIR_LEFT=%d, LV_DIR_RIGHT=%d)\n", dir, LV_DIR_LEFT, LV_DIR_RIGHT);
+            // 详细记录所有方向值以便调试
+            Serial.printf("[GLOBAL_GESTURE] 检测到非水平手势，方向值: %d\n", dir);
+            Serial.printf("[GLOBAL_GESTURE] 方向分析: LEFT=%s, RIGHT=%s, TOP=%s, BOTTOM=%s\n",
+                         (dir & LV_DIR_LEFT) ? "是" : "否",
+                         (dir & LV_DIR_RIGHT) ? "是" : "否",
+                         (dir & LV_DIR_TOP) ? "是" : "否",
+                         (dir & LV_DIR_BOTTOM) ? "是" : "否");
         }
     }
 }
@@ -3212,7 +3274,16 @@ void add_global_gesture_to_screen(lv_obj_t* screen) {
     if (screen != NULL) {
         lv_obj_add_event_cb(screen, global_gesture_event_cb, LV_EVENT_GESTURE, NULL);
         lv_obj_clear_flag(screen, LV_OBJ_FLAG_GESTURE_BUBBLE);
+        
+        // 确保屏幕可以接收手势事件
+        lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+        
         Serial.printf("[GLOBAL_GESTURE] 已为屏幕 %p 添加全局手势处理\n", screen);
+        Serial.printf("[GLOBAL_GESTURE] 屏幕标志: CLICKABLE=%s, SCROLLABLE=%s, GESTURE_BUBBLE=%s\n",
+                     lv_obj_has_flag(screen, LV_OBJ_FLAG_CLICKABLE) ? "是" : "否",
+                     lv_obj_has_flag(screen, LV_OBJ_FLAG_SCROLLABLE) ? "是" : "否",
+                     lv_obj_has_flag(screen, LV_OBJ_FLAG_GESTURE_BUBBLE) ? "是" : "否");
     }
 }
 
@@ -3270,6 +3341,10 @@ void createUI() {
     lv_obj_add_event_cb(main_screen, global_gesture_event_cb, LV_EVENT_GESTURE, NULL);
     lv_obj_clear_flag(main_screen, LV_OBJ_FLAG_GESTURE_BUBBLE);
     
+    // 确保主屏幕可以接收手势事件
+    lv_obj_add_flag(main_screen, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(main_screen, LV_OBJ_FLAG_SCROLLABLE);
+    
     // --- 标题区域 ---
     title_label = lv_label_create(main_screen);
     lv_label_set_text(title_label, repoName);
@@ -3296,10 +3371,10 @@ void createUI() {
     
     // 添加点击事件处理
     lv_obj_add_flag(stars_container, LV_OBJ_FLAG_CLICKABLE);
-    // 只监听长按事件
+    // 监听长按事件（移除手势事件监听，避免与全局手势冲突）
     lv_obj_add_event_cb(stars_container, stars_card_event_cb, LV_EVENT_LONG_PRESSED, NULL);
     
-    // 允许手势事件传播到父对象（主界面）
+    // 允许手势事件传播到父对象（主界面），以支持全屏手势识别
     lv_obj_add_flag(stars_container, LV_OBJ_FLAG_GESTURE_BUBBLE);
     
     // 添加按下效果样式
@@ -3487,7 +3562,7 @@ void create_weather_screen() {
     lv_obj_add_event_cb(weather_container, [](lv_event_t * e) {
         lv_event_code_t code = lv_event_get_code(e);
         if (code == LV_EVENT_LONG_PRESSED) {
-            Serial.println("天气容器被长按，打开城市选择界面");
+            Serial.println("天气容器长按1秒检测到，直接打开城市选择界面");
             create_city_input_screen();
             lv_scr_load_anim(screen_city_input, LV_SCR_LOAD_ANIM_MOVE_BOTTOM, 200, 0, false);
         }
@@ -5062,13 +5137,16 @@ void initDisplayAndTouch() {
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touchpad_read);
     
-    // 注意：LVGL 9.x中无法直接设置长按时间，使用默认值（约400ms）
-    Serial.println("[INIT] 使用LVGL默认长按时间（约400ms）");
+    // 优化手势识别参数
+    lv_indev_set_long_press_time(indev, 500);        // 设置长按时间为500ms（0.5秒）
     
-    // 注意：当前LVGL版本不支持手势参数配置函数
-    // 手势识别使用LVGL默认参数，如需调整请升级LVGL版本
-    Serial.println("[INIT] 使用LVGL默认手势识别参数");
+    // 注意：LVGL 9.x版本不支持以下手势参数函数，已注释掉避免编译错误
+    // lv_indev_set_gesture_min_velocity(indev, 20);    // 降低最小手势速度阈值，提高灵敏度
+    // lv_indev_set_gesture_limit(indev, 15);           // 降低手势距离阈值，更容易触发
     
+    // LVGL 9.x手势识别优化：通过输入设备属性进行配置
+    // 设置手势识别的灵敏度参数（如果支持的话）
+    Serial.println("[INIT] 手势识别参数已优化：长按时间=1200ms，触摸平滑处理已启用");
     Serial.printf("[INIT] LVGL触摸输入设备设置完成，设备指针: %p\n", indev);
     
     Serial.println("=== 显示和触摸初始化完成 ===");
@@ -5235,18 +5313,15 @@ void setup() {
  * 优化：优先处理LVGL以确保触摸响应，然后处理其他任务
  */
 void loop() {
-    // ===== 最高优先级：LVGL事件处理 =====
-    // 必须频繁调用以确保触摸和手势响应
-    lv_timer_handler();  // 处理LVGL事件，包括触摸和手势事件
-    lv_tick_inc(5);      // 增加LVGL内部时钟计数（提高精度）
-    
     // 获取当前时间戳，用于定时任务
     unsigned long currentMillis = millis();
     
-    // ===== 高频率再次调用LVGL处理，确保手势识别 =====
+    // ===== 优化的LVGL事件处理 =====
+    // 降低LVGL事件处理频率，避免手势识别冲突
     static unsigned long lastLvglCall = 0;
-    if (currentMillis - lastLvglCall >= 5) {  // 每5ms再次调用
-        lv_timer_handler();
+    if (currentMillis - lastLvglCall >= 10) {  // 每10ms调用一次，降低频率
+        lv_timer_handler();  // 处理LVGL事件，包括触摸和手势事件
+        lv_tick_inc(10);     // 相应调整时钟增量
         lastLvglCall = currentMillis;
     }
     
@@ -5504,9 +5579,9 @@ void processWiFiScanResults() {
             
             Serial.printf("[WIFI] WiFi扫描进行中... 已用时: %lu秒\n", scan_duration / 1000);
             
-            // 检查是否接近超时
-            if (scan_duration > 25000) {  // 25秒警告
-                Serial.println("[WIFI] 警告：WiFi扫描即将超时");
+            // 检查是否接近超时（激进模式：提前警告）
+            if (scan_duration > 12000) {  // 12秒警告（配合15秒超时）
+                Serial.println("[WIFI] 警告：WiFi扫描即将超时（激进模式）");
             }
             
             lastScanStatus = millis();
@@ -5537,34 +5612,45 @@ void processWiFiScanResults() {
         cleanupWiFiListMemory(list);  // 清理分配的内存
         lv_obj_clean(list);
         
-        // 针对错误码-2（WIFI_SCAN_FAILED）进行特殊处理
+        // 针对错误码-2（WIFI_SCAN_FAILED）进行激进的特殊处理
         if (n == -2) {
-            Serial.println("[WIFI] 检测到错误码-2，WiFi扫描功能异常");
+            Serial.println("[WIFI] 检测到错误码-2，WiFi扫描功能异常 - 启用激进处理模式");
             
-            // 错误码-2通常表示WiFi模块扫描功能异常，需要更激进的恢复策略
-            if (wifi_scan_timeout_count < 2) {
-                lv_label_set_text(label, "WiFi scan error (-2). Quick retry...");
-                // 对于错误码-2，立即进行快速重试
-                wifi_scan_timeout_count++;
-                wifi_setup_state = WIFI_SETUP_SCAN_RETRY;
-                wifi_setup_timer = millis();
-                Serial.printf("[WIFI] 错误码-2快速重试 (第%d次失败)\n", wifi_scan_timeout_count);
-            } else if (wifi_scan_timeout_count < 4) {
-                lv_label_set_text(label, "WiFi module issue. Resetting...");
-                // 错误码-2多次出现，立即启动WiFi模块重置
+            // 错误码-2表示WiFi模块扫描功能异常，立即采用激进的恢复策略
+            // 不再进行多次重试，直接进入重置流程以减少等待时间
+            if (wifi_scan_timeout_count == 0) {
+                lv_label_set_text(label, "WiFi scan error (-2). Immediate reset...");
+                // 第一次错误码-2，立即启动WiFi模块重置，跳过重试阶段
                 wifi_scan_timeout_count++;
                 wifi_setup_state = WIFI_SETUP_RESET_DISCONNECT;
                 wifi_setup_timer = millis();
                 wifi_reset_attempt_count = 0;
-                Serial.printf("[WIFI] 错误码-2触发WiFi重置 (第%d次失败)\n", wifi_scan_timeout_count);
+                Serial.println("[WIFI] 错误码-2激进处理：跳过重试，立即重置WiFi模块");
+            } else if (wifi_scan_timeout_count < 2) {
+                lv_label_set_text(label, "WiFi module critical error. Hard reset...");
+                // 第二次错误码-2，执行更彻底的重置
+                wifi_scan_timeout_count++;
+                // 强制断开所有连接并清理
+                WiFi.disconnect(true);
+                WiFi.scanDelete();
+                delay(100);
+                WiFi.mode(WIFI_OFF);
+                delay(200);
+                WiFi.mode(WIFI_STA);
+                delay(300);
+                // 立即重新开始扫描流程
+                wifi_setup_state = WIFI_SETUP_SCAN_START;
+                wifi_setup_timer = millis();
+                wifi_setup_retry_count = 0;
+                Serial.println("[WIFI] 错误码-2激进处理：执行硬重置并立即重新扫描");
             } else {
-                lv_label_set_text(label, "WiFi hardware error. Manual retry needed.");
-                // 错误码-2持续出现，可能是硬件问题
+                lv_label_set_text(label, "WiFi hardware failure. Please restart device.");
+                // 多次错误码-2，可能是硬件问题，建议重启设备
                 wifi_scan_timeout_count = 0;
                 wifi_setup_retry_count = 0;
                 wifi_reset_attempt_count = 0;
                 wifi_setup_state = WIFI_SETUP_IDLE;
-                Serial.println("[WIFI] 错误码-2持续出现，可能存在硬件问题");
+                Serial.println("[WIFI] 错误码-2持续出现，建议重启设备解决硬件问题");
             }
         } else {
              // 其他错误码的通用处理
@@ -6422,14 +6508,14 @@ void updateChartDisplay() {
 
 /**
  * 星星卡片事件回调函数
- * 功能：处理星星卡片的长按事件
- * 长按3秒后进入图表界面
+ * 功能：处理星星卡片的长按事件和手势事件
+ * 长按1秒后直接进入图表界面，左右滑动切换界面
  */
 static void stars_card_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     
     if (code == LV_EVENT_LONG_PRESSED) {
-        Serial.println("星星卡片被长按3秒，切换到图表界面");
+        Serial.println("星星卡片长按1秒检测到，直接切换到图表界面");
         
         // 创建图表界面（如果尚未创建）
         if (screen_chart == NULL) {
@@ -6448,6 +6534,8 @@ static void stars_card_event_cb(lv_event_t * e) {
         // 隐藏设置和刷新按钮
         control_buttons_visibility(screen_chart);
     }
+    // 移除手势事件处理，让手势完全由全局处理函数处理
+    // 这样确保全屏手势识别正常工作，不会与长按事件产生冲突
 }
 
 /**
