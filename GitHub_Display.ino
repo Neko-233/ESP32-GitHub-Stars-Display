@@ -199,6 +199,26 @@ bool isManualRefreshing = false;         // 是否正在手动刷新
 bool refreshButtonGreen = false;         // 刷新按钮是否为绿色状态
 bool waitingForRetry = false;            // 是否正在等待重试
 
+// 非阻塞数据获取状态机
+enum FetchState {
+    FETCH_IDLE,           // 空闲状态
+    FETCH_STARTING,       // 开始获取
+    FETCH_CONNECTING,     // 连接中
+    FETCH_REQUESTING,     // 请求中
+    FETCH_PROCESSING,     // 处理响应
+    FETCH_COMPLETED,      // 完成
+    FETCH_ERROR           // 错误
+};
+
+FetchState currentFetchState = FETCH_IDLE;
+WiFiClientSecure* asyncClient = nullptr;
+HTTPClient* asyncHttp = nullptr;
+unsigned long fetchStartTime = 0;
+unsigned long fetchTimeout = 8000;  // 8秒超时
+String fetchUrl = "";
+int fetchProgress = 0;
+String fetchResponse = "";
+
 // WiFi设置状态机相关变量
 enum WiFiSetupState {
   WIFI_SETUP_IDLE,
@@ -375,7 +395,10 @@ void updatePageIndicator(int current_page);                  // 更新页面指�
 // 数据管理函数
 void load_settings();                                         // 从NVS加载配置设置
 void save_settings();                                         // 将配置设置保存到NVS
-void fetchGitHubData();                                       // 获取GitHub仓库数据
+void fetchGitHubData();                                       // 获取GitHub仓库数据（阻塞式，保留兼容性）
+void startAsyncFetchGitHubData();                            // 启动非阻塞GitHub数据获取
+void processAsyncFetchGitHubData();                          // 处理非阻塞GitHub数据获取状态机
+void cleanupAsyncFetch();                                    // 清理异步获取资源
 void saveStarData(int starCount);                             // 保存星标数据到文件
 void saveDailyStarData(int starCount);                        // 保存每日星标数据
 void saveGrowthData(int starCount);                           // 保存增长数据
@@ -4153,7 +4176,7 @@ void processWiFiConnectionStateMachine() {
                             
                             // 即使NTP失败，也尝试获取GitHub数据
                             Serial.println("开始获取GitHub数据...");
-                            fetchGitHubData();
+                            startAsyncFetchGitHubData();
                             
                             // 重置所有静态变量，为下次连接做准备
                             wifi_success_logged = false;
@@ -4641,7 +4664,283 @@ void fetchGitHubData() {
     updateProgressBar(); // 恢复进度条正常显示
     
     Serial.println("UI界面数据已更新");
-    Serial.println("=== GitHub数据获取完成 ===\n");
+    Serial.println("=== GitHub数据获取完成 ===");
+}
+
+/**
+ * 启动非阻塞GitHub数据获取
+ * 功能：初始化异步数据获取流程，设置状态机为开始状态
+ * 特点：立即返回，不阻塞主循环
+ */
+void startAsyncFetchGitHubData() {
+    Serial.println("\n=== 启动非阻塞GitHub数据获取 ===");
+    
+    // 检查WiFi连接状态
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("错误: WiFi未连接，无法获取数据");
+        updateStatus("WiFi Disconnected", lv_color_hex(0xef4444));
+        show_network_error_message_box("Network Error", "WiFi not connected.\nCannot fetch GitHub data.\nTap OK to go to Settings.");
+        return;
+    }
+    
+    // 检查是否已经在获取数据
+    if (currentFetchState != FETCH_IDLE) {
+        Serial.println("数据获取已在进行中，跳过新的请求");
+        return;
+    }
+    
+    // 设置获取数据标志
+    isFetchingData = true;
+    currentFetchState = FETCH_STARTING;
+    fetchStartTime = millis();
+    fetchProgress = 0;
+    fetchResponse = "";
+    
+    // 构建请求URL
+    fetchUrl = "https://api.github.com/repos/" + String(repoOwner) + "/" + String(repoName);
+    
+    // 初始化UI状态
+    const char* current_stars_text = lv_label_get_text(stars_count_label);
+    bool isFirstTime = (strcmp(current_stars_text, "---") == 0);
+    
+    if (isFirstTime) {
+        Serial.println("开机第一次获取数据，保持占位符显示...");
+    } else {
+        Serial.println("数据更新，保持当前数字显示，准备使用数字滚动动画...");
+    }
+    
+    updateStatus("Fetching data...", lv_color_hex(0x3b82f6));
+    lv_obj_clear_flag(progress_bar, LV_OBJ_FLAG_HIDDEN);
+    lv_bar_set_value(progress_bar, 10, LV_ANIM_OFF);
+    
+    Serial.printf("目标仓库: %s/%s\n", repoOwner, repoName);
+    Serial.println("非阻塞数据获取已启动");
+}
+
+/**
+ * 处理非阻塞GitHub数据获取状态机
+ * 功能：在主循环中调用，处理异步数据获取的各个阶段
+ * 特点：每次调用只处理一个状态，保持UI响应性
+ */
+void processAsyncFetchGitHubData() {
+    if (currentFetchState == FETCH_IDLE) {
+        return;  // 空闲状态，无需处理
+    }
+    
+    // 检查超时
+    if (millis() - fetchStartTime > fetchTimeout) {
+        Serial.println("数据获取超时");
+        currentFetchState = FETCH_ERROR;
+        updateStatus("Request timeout", lv_color_hex(0xef4444));
+        show_network_error_message_box("Timeout Error", "Request timeout.\nPlease check your network connection.");
+        cleanupAsyncFetch();
+        return;
+    }
+    
+    switch (currentFetchState) {
+        case FETCH_STARTING:
+            Serial.println("开始连接到GitHub API...");
+            
+            // 创建客户端对象
+            asyncClient = new WiFiClientSecure();
+            asyncHttp = new HTTPClient();
+            
+            if (!asyncClient || !asyncHttp) {
+                Serial.println("内存分配失败");
+                currentFetchState = FETCH_ERROR;
+                updateStatus("Memory error", lv_color_hex(0xef4444));
+                cleanupAsyncFetch();
+                return;
+            }
+            
+            // 配置安全客户端
+            asyncClient->setInsecure();
+            
+            // 开始HTTP连接
+            if (asyncHttp->begin(*asyncClient, fetchUrl)) {
+                asyncHttp->addHeader("Authorization", "Bearer " + String(githubToken));
+                asyncHttp->addHeader("User-Agent", "ESP32-GitHub-Display");
+                asyncHttp->setTimeout(5000);
+                
+                currentFetchState = FETCH_CONNECTING;
+                lv_bar_set_value(progress_bar, 30, LV_ANIM_ON);
+                Serial.println("HTTP连接已初始化");
+            } else {
+                Serial.println("HTTP连接初始化失败");
+                currentFetchState = FETCH_ERROR;
+                updateStatus("Connection failed", lv_color_hex(0xef4444));
+                cleanupAsyncFetch();
+            }
+            break;
+            
+        case FETCH_CONNECTING:
+        {
+            Serial.println("发送HTTP请求...");
+            
+            // 发送GET请求（这个操作相对较快）
+            int httpCode = asyncHttp->GET();
+            
+            if (httpCode > 0) {
+                Serial.printf("HTTP响应码: %d\n", httpCode);
+                currentFetchState = FETCH_PROCESSING;
+                lv_bar_set_value(progress_bar, 70, LV_ANIM_ON);
+                
+                if (httpCode == HTTP_CODE_OK) {
+                    // 开始获取响应数据
+                    fetchResponse = asyncHttp->getString();
+                    Serial.printf("响应数据长度: %d 字节\n", fetchResponse.length());
+                } else {
+                    // HTTP错误
+                    Serial.printf("HTTP请求失败，错误码: %d\n", httpCode);
+                    currentFetchState = FETCH_ERROR;
+                    
+                    // 处理不同的HTTP错误码
+                    String errorTitle = "GitHub Error";
+                    String errorMessage = "";
+                    String statusMessage = "";
+                    
+                    switch (httpCode) {
+                        case 404:
+                            statusMessage = "Repository not found";
+                            errorMessage = "Repository not found.\nPlease check if the owner and repository name are correct.";
+                            break;
+                        case 401:
+                            statusMessage = "Unauthorized access";
+                            errorMessage = "GitHub Token is invalid or expired.\nPlease check your token in settings.";
+                            break;
+                        case 403:
+                            statusMessage = "Access forbidden";
+                            errorMessage = "GitHub Token is invalid or API rate limit exceeded.\nPlease check your token or try again later.";
+                            break;
+                        case 429:
+                            statusMessage = "Rate limit exceeded";
+                            errorMessage = "API requests too frequent.\nPlease wait a moment and try again.";
+                            break;
+                        default:
+                            statusMessage = "HTTP Error: " + String(httpCode);
+                            errorMessage = "Failed to fetch GitHub data.\nHTTP Error: " + String(httpCode);
+                            break;
+                    }
+                    
+                    updateStatus(statusMessage.c_str(), lv_color_hex(0xef4444));
+                    show_network_error_message_box(errorTitle.c_str(), errorMessage.c_str());
+                    cleanupAsyncFetch();
+                }
+            } else {
+                Serial.printf("HTTP请求失败，错误码: %d\n", httpCode);
+                currentFetchState = FETCH_ERROR;
+                updateStatus("Connection Failed", lv_color_hex(0xef4444));
+                
+                // 设置重试机制
+                waitingForRetry = true;
+                retryTime = millis() + RETRY_INTERVAL;
+                Serial.println("设置重试机制，1秒后重新获取数据");
+                
+                show_network_error_message_box("Network Error", "Network connection failed.\nTrying to reconnect in 1 second...");
+                cleanupAsyncFetch();
+            }
+        }
+            break;
+            
+        case FETCH_PROCESSING:
+            Serial.println("处理JSON响应数据...");
+            
+            if (fetchResponse.length() > 0) {
+                DynamicJsonDocument doc(2048);
+                DeserializationError error = deserializeJson(doc, fetchResponse);
+                
+                if (error == DeserializationError::Ok) {
+                    // JSON解析成功
+                    Serial.println("JSON解析成功，提取数据...");
+                    
+                    currentStars = doc["stargazers_count"].as<int>();
+                    currentForks = doc["forks_count"].as<int>();
+                    currentWatchers = doc["subscribers_count"].as<int>();
+                    
+                    Serial.printf("获取到的数据: Stars: %d, Forks: %d, Watchers: %d\n", 
+                                currentStars, currentForks, currentWatchers);
+                    
+                    // 检查并更新每日数据
+                    checkAndUpdateDailyData();
+                    
+                    // 保存数据
+                    saveStarData(currentStars);
+                    saveGrowthData(currentStars);
+                    
+                    // 更新上次保存的星标数
+                    lastSavedStars = currentStars;
+                    save_settings();
+                    
+                    currentFetchState = FETCH_COMPLETED;
+                    lv_bar_set_value(progress_bar, 100, LV_ANIM_ON);
+                    
+                    // 更新UI状态为成功
+                    updateStatus("Update successful", lv_color_hex(0x10b981));
+                    showingUpdateSuccess = true;
+                    updateSuccessTime = millis();
+                    lv_label_set_text(time_label, "Last Upd: <1 min");
+                    
+                    // 清除重试状态
+                    waitingForRetry = false;
+                    
+                    Serial.println("数据处理完成，准备更新显示");
+                } else {
+                    Serial.printf("JSON解析失败: %s\n", error.c_str());
+                    currentFetchState = FETCH_ERROR;
+                    updateStatus("Data parse error", lv_color_hex(0xef4444));
+                    cleanupAsyncFetch();
+                }
+            } else {
+                Serial.println("响应数据为空");
+                currentFetchState = FETCH_ERROR;
+                updateStatus("Empty response", lv_color_hex(0xef4444));
+                cleanupAsyncFetch();
+            }
+            break;
+            
+        case FETCH_COMPLETED:
+            Serial.println("数据获取完成，更新显示");
+            
+            // 更新显示
+            updateDisplay();
+            updateProgressBar();
+            
+            // 清理资源
+            cleanupAsyncFetch();
+            
+            Serial.println("=== 非阻塞GitHub数据获取完成 ===");
+            break;
+            
+        case FETCH_ERROR:
+            Serial.println("数据获取出错，清理资源");
+            cleanupAsyncFetch();
+            break;
+    }
+}
+
+/**
+ * 清理异步获取资源
+ * 功能：释放HTTP客户端资源，重置状态机
+ */
+void cleanupAsyncFetch() {
+    // 清理HTTP资源
+    if (asyncHttp) {
+        asyncHttp->end();
+        delete asyncHttp;
+        asyncHttp = nullptr;
+    }
+    
+    if (asyncClient) {
+        delete asyncClient;
+        asyncClient = nullptr;
+    }
+    
+    // 重置状态
+    currentFetchState = FETCH_IDLE;
+    isFetchingData = false;
+    fetchResponse = "";
+    
+    Serial.println("异步获取资源已清理");
 }
 
 /**
@@ -5048,7 +5347,7 @@ void updateProgressBar() {
             Serial.println("手动刷新倒计时结束，开始获取数据");
             isManualRefreshing = false;
             lastDataUpdate = millis();  // 更新时间戳
-            fetchGitHubData();  // 执行数据刷新
+            startAsyncFetchGitHubData();  // 执行数据刷新
             
             // 按钮变回蓝色
             lv_obj_set_style_bg_color(touch_test_btn, lv_color_hex(0x007BFF), 0);
@@ -5360,7 +5659,7 @@ void loop() {
             if (timeSinceLastUpdate >= 30000 && !isFetchingData) {  // 至少间隔30秒
                 Serial.printf("[DEBUG] WiFi连接成功后获取数据，距离上次更新: %lu ms\n", timeSinceLastUpdate);
                 lastDataUpdate = currentMillis;  // 更新时间戳
-                fetchGitHubData();
+                startAsyncFetchGitHubData();
             } else {
                 Serial.printf("[DEBUG] WiFi连接成功但跳过数据获取，距离上次更新仅: %lu ms\n", timeSinceLastUpdate);
             }
@@ -5436,9 +5735,13 @@ void loop() {
                 // 阶段3：处理WiFi状态监控
                 processWiFiMonitoring(currentMillis);
                 break;
+            case 4:
+                // 阶段4：处理非阻塞数据获取状态机
+                processAsyncFetchGitHubData();
+                break;
         }
         
-        systemTaskPhase = (systemTaskPhase + 1) % 4;  // 循环执行4个阶段
+        systemTaskPhase = (systemTaskPhase + 1) % 5;  // 循环执行5个阶段
         lastSystemTaskTime = currentMillis;
     }
     
@@ -5713,7 +6016,7 @@ void processUpdateAndRetry(unsigned long currentMillis) {
             if (timeSinceLastUpdate >= 10000) {  // 至少间隔10秒
                 Serial.printf("[DEBUG] 重试获取数据，距离上次更新: %lu ms\n", timeSinceLastUpdate);
                 lastDataUpdate = currentMillis;  // 更新时间戳
-                fetchGitHubData();
+                startAsyncFetchGitHubData();
             } else {
                 Serial.printf("[DEBUG] 重试跳过数据获取，距离上次更新仅: %lu ms\n", timeSinceLastUpdate);
             }
@@ -5730,7 +6033,7 @@ void processDataFetching(unsigned long currentMillis) {
     if (WiFi.status() == WL_CONNECTED && currentMillis - lastDataUpdate >= UPDATE_INTERVAL && !isFetchingData) {
         Serial.printf("[DEBUG] 定时器触发GitHub数据获取，距离上次更新: %lu ms\n", currentMillis - lastDataUpdate);
         lastDataUpdate = currentMillis;  // 立即更新时间戳，防止重复触发
-        fetchGitHubData();           // 获取最新的GitHub仓库数据
+        startAsyncFetchGitHubData();  // 启动非阻塞GitHub数据获取
     }
     
     // 定时获取天气数据（每10分钟更新一次，仅在WiFi连接时执行）
@@ -5804,7 +6107,7 @@ void processWiFiMonitoring(unsigned long currentMillis) {
         if (lastDataUpdate == 0) {
             Serial.println("[DEBUG] 首次WiFi连接，立即开始数据获取");
             lastDataUpdate = currentMillis;  // 设置初始时间戳，启动进度条显示
-            fetchGitHubData();  // 立即获取GitHub数据
+            startAsyncFetchGitHubData();  // 立即获取GitHub数据
             
             // 同时获取天气数据
             lastWeatherUpdate = currentMillis;
@@ -5815,7 +6118,7 @@ void processWiFiMonitoring(unsigned long currentMillis) {
             if (timeSinceLastUpdate >= 60000 && !isFetchingData) {  // 至少间隔1分钟
                 Serial.printf("[DEBUG] WiFi重连后获取数据，距离上次更新: %lu ms\n", timeSinceLastUpdate);
                 lastDataUpdate = currentMillis;  // 更新时间戳
-                fetchGitHubData();
+                startAsyncFetchGitHubData();
             } else {
                 Serial.printf("[DEBUG] WiFi重连但跳过数据获取，距离上次更新仅: %lu ms\n", timeSinceLastUpdate);
             }
@@ -5859,7 +6162,7 @@ void processSystemTasks(unsigned long currentMillis) {
             if (timeSinceLastUpdate >= 10000) {  // 至少间隔10秒
                 Serial.printf("[DEBUG] 重试获取数据，距离上次更新: %lu ms\n", timeSinceLastUpdate);
                 lastDataUpdate = currentMillis;  // 更新时间戳
-                fetchGitHubData();
+                startAsyncFetchGitHubData();
             } else {
                 Serial.printf("[DEBUG] 重试跳过数据获取，距离上次更新仅: %lu ms\n", timeSinceLastUpdate);
             }
@@ -5870,7 +6173,7 @@ void processSystemTasks(unsigned long currentMillis) {
     if (WiFi.status() == WL_CONNECTED && currentMillis - lastDataUpdate >= UPDATE_INTERVAL && !isFetchingData) {
         Serial.printf("[DEBUG] 定时器触发GitHub数据获取，距离上次更新: %lu ms\n", currentMillis - lastDataUpdate);
         lastDataUpdate = currentMillis;  // 立即更新时间戳，防止重复触发
-        fetchGitHubData();           // 获取最新的GitHub仓库数据
+        startAsyncFetchGitHubData();           // 获取最新的GitHub仓库数据
     }
     
     // 定时获取天气数据（每10分钟更新一次，仅在WiFi连接时执行）
@@ -5963,7 +6266,7 @@ void processSystemTasks(unsigned long currentMillis) {
         if (lastDataUpdate == 0) {
             Serial.println("[DEBUG] 首次WiFi连接，立即开始数据获取");
             lastDataUpdate = currentMillis;  // 设置初始时间戳，启动进度条显示
-            fetchGitHubData();  // 立即获取GitHub数据
+            startAsyncFetchGitHubData();  // 立即获取GitHub数据
             
             // 同时获取天气数据
             lastWeatherUpdate = currentMillis;
@@ -5974,7 +6277,7 @@ void processSystemTasks(unsigned long currentMillis) {
             if (timeSinceLastUpdate >= 60000 && !isFetchingData) {  // 至少间隔1分钟
                 Serial.printf("[DEBUG] WiFi重连后获取数据，距离上次更新: %lu ms\n", timeSinceLastUpdate);
                 lastDataUpdate = currentMillis;  // 更新时间戳
-                fetchGitHubData();
+                startAsyncFetchGitHubData();
             } else {
                 Serial.printf("[DEBUG] WiFi重连但跳过数据获取，距离上次更新仅: %lu ms\n", timeSinceLastUpdate);
             }
