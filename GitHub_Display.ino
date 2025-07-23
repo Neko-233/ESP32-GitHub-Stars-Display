@@ -199,6 +199,17 @@ bool isManualRefreshing = false;         // 是否正在手动刷新
 bool refreshButtonGreen = false;         // 刷新按钮是否为绿色状态
 bool waitingForRetry = false;            // 是否正在等待重试
 
+// 自动修复和错误恢复相关变量
+int fetchRetryCount = 0;                 // 当前重试次数
+const int MAX_RETRY_COUNT = 3;           // 最大重试次数
+bool autoRetryEnabled = true;            // 是否启用自动重试
+lv_obj_t* current_error_dialog = nullptr; // 当前显示的错误对话框
+unsigned long lastSuccessTime = 0;       // 上次成功获取数据的时间戳
+bool errorRecoveryMode = false;          // 是否处于错误恢复模式
+unsigned long nextRetryTime = 0;         // 下次重试时间戳
+const unsigned long RETRY_DELAY_BASE = 5000;  // 基础重试延迟：5秒
+const unsigned long RETRY_DELAY_INCREMENT = 5000; // 重试延迟递增：每次增加5秒
+
 // 非阻塞数据获取状态机
 enum FetchState {
     FETCH_IDLE,           // 空闲状态
@@ -360,6 +371,13 @@ const char* DEFAULT_LOCATION = "110101";  // 默认位置ID（北京东城区）
 String userLocation = DEFAULT_LOCATION;  // 用户设置的位置ID
 
 // ===== 函数前置声明 =====
+// 自动修复和错误恢复函数
+void hideErrorDialog();                                       // 隐藏错误对话框
+void resetRetryState();                                       // 重置重试状态
+void scheduleAutoRetry();                                     // 安排自动重试
+void processAutoRetry();                                      // 处理自动重试逻辑
+bool shouldRetry();                                           // 判断是否应该重试
+
 // WiFi设置状态机函数
 void processWiFiSetupStateMachine();                          // 处理WiFi设置状态机
 void printWiFiScanStatistics();                               // 打印WiFi扫描统计信息
@@ -624,6 +642,7 @@ static void show_network_error_message_box(const char* title, const char* messag
     
     // 创建半透明遮罩层，覆盖整个屏幕
     lv_obj_t* shader = lv_obj_create(lv_layer_top());  // 在顶层创建遮罩
+    current_error_dialog = shader;  // 保存错误对话框引用
     lv_obj_set_size(shader, LV_PCT(100), LV_PCT(100));  // 设置为全屏大小
     lv_obj_set_style_bg_color(shader, lv_color_black(), 0);  // 设置黑色背景
     lv_obj_set_style_bg_opa(shader, LV_OPA_50, 0);  // 设置50%透明度
@@ -4823,21 +4842,37 @@ void processAsyncFetchGitHubData() {
                     }
                     
                     updateStatus(statusMessage.c_str(), lv_color_hex(0xef4444));
-                    show_network_error_message_box(errorTitle.c_str(), errorMessage.c_str());
-                    cleanupAsyncFetch();
+                    
+                    // 检查是否应该自动重试
+                    if (shouldRetry()) {
+                        Serial.printf("[AUTO_RECOVERY] HTTP错误 %d，安排自动重试\n", httpCode);
+                        scheduleAutoRetry();
+                        cleanupAsyncFetch();
+                    } else {
+                        // 显示错误对话框
+                        show_network_error_message_box(errorTitle.c_str(), errorMessage.c_str());
+                        cleanupAsyncFetch();
+                    }
                 }
             } else {
                 Serial.printf("HTTP请求失败，错误码: %d\n", httpCode);
                 currentFetchState = FETCH_ERROR;
                 updateStatus("Connection Failed", lv_color_hex(0xef4444));
                 
-                // 设置重试机制
-                waitingForRetry = true;
-                retryTime = millis() + RETRY_INTERVAL;
-                Serial.println("设置重试机制，1秒后重新获取数据");
-                
-                show_network_error_message_box("Network Error", "Network connection failed.\nTrying to reconnect in 1 second...");
-                cleanupAsyncFetch();
+                // 检查是否应该自动重试
+                if (shouldRetry()) {
+                    Serial.printf("[AUTO_RECOVERY] 网络连接失败，安排自动重试\n");
+                    scheduleAutoRetry();
+                    cleanupAsyncFetch();
+                } else {
+                    // 设置传统重试机制（保持兼容性）
+                    waitingForRetry = true;
+                    retryTime = millis() + RETRY_INTERVAL;
+                    Serial.println("设置重试机制，1秒后重新获取数据");
+                    
+                    show_network_error_message_box("Network Error", "Network connection failed.\nTrying to reconnect in 1 second...");
+                    cleanupAsyncFetch();
+                }
             }
         }
             break;
@@ -4883,17 +4918,41 @@ void processAsyncFetchGitHubData() {
                     // 清除重试状态
                     waitingForRetry = false;
                     
+                    // 记录成功时间并重置自动重试状态
+                    lastSuccessTime = millis();
+                    resetRetryState();
+                    
+                    // 自动隐藏错误对话框
+                    hideErrorDialog();
+                    
+                    Serial.println("[AUTO_RECOVERY] 数据获取成功，重置重试状态并隐藏错误对话框");
                     Serial.println("数据处理完成，准备更新显示");
                 } else {
                     Serial.printf("JSON解析失败: %s\n", error.c_str());
                     currentFetchState = FETCH_ERROR;
                     updateStatus("Data parse error", lv_color_hex(0xef4444));
+                    
+                    // 检查是否应该自动重试
+                    if (shouldRetry()) {
+                        Serial.println("[AUTO_RECOVERY] JSON解析失败，安排自动重试");
+                        scheduleAutoRetry();
+                    } else {
+                        show_network_error_message_box("Data Error", "Failed to parse GitHub data.\nPlease check your network connection.");
+                    }
                     cleanupAsyncFetch();
                 }
             } else {
                 Serial.println("响应数据为空");
                 currentFetchState = FETCH_ERROR;
                 updateStatus("Empty response", lv_color_hex(0xef4444));
+                
+                // 检查是否应该自动重试
+                if (shouldRetry()) {
+                    Serial.println("[AUTO_RECOVERY] 响应数据为空，安排自动重试");
+                    scheduleAutoRetry();
+                } else {
+                    show_network_error_message_box("Data Error", "Empty response from GitHub.\nPlease check your network connection.");
+                }
                 cleanupAsyncFetch();
             }
             break;
@@ -5739,9 +5798,13 @@ void loop() {
                 // 阶段4：处理非阻塞数据获取状态机
                 processAsyncFetchGitHubData();
                 break;
+            case 5:
+                // 阶段5：处理自动重试逻辑
+                processAutoRetry();
+                break;
         }
         
-        systemTaskPhase = (systemTaskPhase + 1) % 5;  // 循环执行5个阶段
+        systemTaskPhase = (systemTaskPhase + 1) % 6;  // 循环执行6个阶段
         lastSystemTaskTime = currentMillis;
     }
     
@@ -6921,4 +6984,118 @@ static void chart_mode_event_cb(lv_event_t * e) {
                 break;
         }
     }
+}
+
+// ===== 自动修复和错误恢复函数实现 =====
+
+/**
+ * 隐藏错误对话框函数
+ * 功能：自动隐藏当前显示的错误对话框
+ */
+void hideErrorDialog() {
+    if (current_error_dialog != nullptr && networkErrorShowing) {
+        Serial.println("[AUTO_RECOVERY] 自动隐藏错误对话框");
+        lv_obj_del(current_error_dialog);
+        current_error_dialog = nullptr;
+        networkErrorShowing = false;
+    }
+}
+
+/**
+ * 重置重试状态函数
+ * 功能：重置所有重试相关的状态变量
+ */
+void resetRetryState() {
+    fetchRetryCount = 0;
+    errorRecoveryMode = false;
+    nextRetryTime = 0;
+    Serial.println("[AUTO_RECOVERY] 重试状态已重置");
+}
+
+/**
+ * 安排自动重试函数
+ * 功能：根据当前重试次数计算下次重试时间
+ */
+void scheduleAutoRetry() {
+    if (!autoRetryEnabled || fetchRetryCount >= MAX_RETRY_COUNT) {
+        Serial.printf("[AUTO_RECOVERY] 不安排重试 - 自动重试: %s, 重试次数: %d/%d\n", 
+                     autoRetryEnabled ? "启用" : "禁用", fetchRetryCount, MAX_RETRY_COUNT);
+        return;
+    }
+    
+    fetchRetryCount++;
+    errorRecoveryMode = true;
+    
+    // 计算重试延迟：基础延迟 + (重试次数 * 递增延迟)
+    unsigned long retryDelay = RETRY_DELAY_BASE + (fetchRetryCount - 1) * RETRY_DELAY_INCREMENT;
+    nextRetryTime = millis() + retryDelay;
+    
+    Serial.printf("[AUTO_RECOVERY] 安排第 %d 次重试，延迟 %lu 秒\n", 
+                 fetchRetryCount, retryDelay / 1000);
+    
+    // 更新状态显示
+    char statusMsg[50];
+    snprintf(statusMsg, sizeof(statusMsg), "Retry %d/%d in %lus", 
+             fetchRetryCount, MAX_RETRY_COUNT, retryDelay / 1000);
+    updateStatus(statusMsg, lv_color_hex(0xf59e0b)); // 橙色表示重试状态
+}
+
+/**
+ * 处理自动重试逻辑函数
+ * 功能：检查是否到了重试时间，如果是则执行重试
+ */
+void processAutoRetry() {
+    if (!errorRecoveryMode || nextRetryTime == 0) {
+        return;
+    }
+    
+    unsigned long currentTime = millis();
+    if (currentTime >= nextRetryTime) {
+        Serial.printf("[AUTO_RECOVERY] 执行第 %d 次自动重试\n", fetchRetryCount);
+        
+        // 重置重试时间
+        nextRetryTime = 0;
+        
+        // 检查WiFi连接状态
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[AUTO_RECOVERY] WiFi未连接，跳过重试");
+            scheduleAutoRetry(); // 安排下次重试
+            return;
+        }
+        
+        // 启动数据获取
+        if (currentFetchState == FETCH_IDLE) {
+            Serial.println("[AUTO_RECOVERY] 启动自动重试数据获取");
+            startAsyncFetchGitHubData();
+        } else {
+            Serial.println("[AUTO_RECOVERY] 数据获取正在进行中，跳过重试");
+            scheduleAutoRetry(); // 安排下次重试
+        }
+    }
+}
+
+/**
+ * 判断是否应该重试函数
+ * 功能：根据错误类型和当前状态判断是否应该进行自动重试
+ * 返回：true表示应该重试，false表示不应该重试
+ */
+bool shouldRetry() {
+    // 检查基本条件
+    if (!autoRetryEnabled || fetchRetryCount >= MAX_RETRY_COUNT) {
+        return false;
+    }
+    
+    // 检查WiFi连接状态
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[AUTO_RECOVERY] WiFi未连接，不进行重试");
+        return false;
+    }
+    
+    // 检查是否正在获取数据
+    if (currentFetchState != FETCH_IDLE && currentFetchState != FETCH_ERROR) {
+        Serial.println("[AUTO_RECOVERY] 数据获取正在进行中，不进行重试");
+        return false;
+    }
+    
+    return true;
 }
